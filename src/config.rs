@@ -17,6 +17,7 @@ use serde::Deserialize;
 
 /// One configured vault: a bridge checkout + agent work-clone pairing.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Vault {
     /// Bridge checkout path (where the daemon operates).
     pub bridge: PathBuf,
@@ -35,6 +36,7 @@ fn default_branch() -> String {
 
 /// Top-level config: `[vaults.<name>]` tables.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
     pub vaults: HashMap<String, Vault>,
@@ -45,6 +47,11 @@ pub struct Config {
 /// `main` downcasts through the error chain for this type to decide the
 /// process exit code: 2 for usage/config errors, 1 otherwise, per
 /// `docs/DESIGN.md`'s exit-code contract.
+///
+/// Use this ONLY for CLI-usage and config-resolution failures (bad vault
+/// name, missing/unparseable config, ambiguous vault selection). Domain
+/// failures — e.g. a sync rebase conflict, a failed push, an unreachable
+/// remote — must remain plain anyhow errors so they exit 1, not 2.
 #[derive(Debug)]
 pub struct UsageError(pub String);
 
@@ -82,11 +89,16 @@ pub fn expand_tilde(path: &Path) -> PathBuf {
 /// Parse a config file at an exact path. Tilde-expands `bridge` and `work`
 /// on every vault.
 pub fn load_from(path: &Path) -> Result<Config> {
-    let text = std::fs::read_to_string(path).map_err(|_| {
-        anyhow::Error::new(UsageError(format!(
-            "config file not found: {}",
-            path.display()
-        )))
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        let msg = if e.kind() == std::io::ErrorKind::NotFound {
+            format!(
+                "config file not found: {} (run `tephra init` to create one)",
+                path.display()
+            )
+        } else {
+            format!("could not read config file {}: {e}", path.display())
+        };
+        anyhow::Error::new(UsageError(msg))
     })?;
     let mut cfg: Config = toml::from_str(&text).map_err(|e| {
         anyhow::Error::new(UsageError(format!(
@@ -125,16 +137,26 @@ pub fn load() -> Result<Config> {
     load_from(&path)
 }
 
+/// A vault picked out of the config, together with its configured name.
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedVault<'a> {
+    pub name: &'a str,
+    pub vault: &'a Vault,
+}
+
 /// Resolve a vault by name, or the sole configured vault if `name` is
 /// `None`. Errors are usage errors (see `UsageError`): unknown name lists
 /// available vaults; `None` with zero or more than one configured vault
 /// lists the available choices (or notes there are none).
-pub fn resolve_vault<'a>(cfg: &'a Config, name: Option<&str>) -> Result<(&'a str, &'a Vault)> {
+pub fn resolve_vault<'a>(cfg: &'a Config, name: Option<&str>) -> Result<ResolvedVault<'a>> {
     match name {
         Some(n) => cfg
             .vaults
             .get_key_value(n)
-            .map(|(k, v)| (k.as_str(), v))
+            .map(|(name, vault)| ResolvedVault {
+                name: name.as_str(),
+                vault,
+            })
             .map_or_else(
                 || {
                     usage_err(format!(
@@ -147,8 +169,13 @@ pub fn resolve_vault<'a>(cfg: &'a Config, name: Option<&str>) -> Result<(&'a str
         None => {
             let mut iter = cfg.vaults.iter();
             match (iter.next(), iter.next()) {
-                (Some((k, v)), None) => Ok((k.as_str(), v)),
-                (None, None) => usage_err("no vaults configured".to_string()),
+                (Some((name, vault)), None) => Ok(ResolvedVault {
+                    name: name.as_str(),
+                    vault,
+                }),
+                (None, None) => {
+                    usage_err("no vaults configured; run `tephra init` to add one".to_string())
+                }
                 _ => usage_err(format!(
                     "multiple vaults configured; specify one: {}",
                     sorted_names(cfg)
@@ -256,15 +283,120 @@ mod tests {
     }
 
     #[test]
-    fn missing_file_error_names_the_path() {
+    fn unknown_vault_field_is_a_parse_error_naming_the_field() {
+        let dir = tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            r#"
+            [vaults.personal]
+            bridge = "/tmp/bridge-personal"
+            work = "/tmp/work-personal"
+            url = "tailgit:obsidian-personal"
+            brnach = "trunk"
+            "#,
+        );
+
+        let err = load_from(&path).unwrap_err();
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("brnach"),
+            "error should name the unknown field, got: {msg}"
+        );
+        assert!(
+            msg.contains(&path.display().to_string()),
+            "error should name the file, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn unknown_top_level_table_is_a_parse_error_naming_the_table() {
+        let dir = tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            r#"
+            [vaulst.oops]
+            bridge = "/tmp/bridge"
+            work = "/tmp/work"
+            url = "tailgit:x"
+            "#,
+        );
+
+        let err = load_from(&path).unwrap_err();
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("vaulst"),
+            "error should name the unknown table, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn empty_file_parses_to_zero_vaults() {
+        let dir = tempdir().unwrap();
+        let path = write_config(dir.path(), "");
+
+        let cfg = load_from(&path).unwrap();
+
+        assert!(cfg.vaults.is_empty());
+    }
+
+    #[test]
+    fn empty_vaults_table_parses_to_zero_vaults() {
+        let dir = tempdir().unwrap();
+        let path = write_config(dir.path(), "[vaults]\n");
+
+        let cfg = load_from(&path).unwrap();
+
+        assert!(cfg.vaults.is_empty());
+    }
+
+    #[test]
+    fn missing_file_error_names_the_path_and_suggests_init() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("nonexistent.toml");
 
         let err = load_from(&path).unwrap_err();
+        let msg = err.to_string();
 
         assert!(
-            err.to_string().contains(&path.display().to_string()),
-            "error should name the missing path, got: {err}"
+            msg.contains(&path.display().to_string()),
+            "error should name the missing path, got: {msg}"
+        );
+        assert!(
+            msg.contains("run `tephra init` to create one"),
+            "error should suggest tephra init, got: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_file_error_says_could_not_read() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let path = write_config(dir.path(), "[vaults]\n");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Running as root makes chmod 000 ineffective; skip in that case.
+        if std::fs::read_to_string(&path).is_ok() {
+            return;
+        }
+
+        let err = load_from(&path).unwrap_err();
+        let msg = err.to_string();
+
+        assert!(
+            msg.starts_with("could not read config file"),
+            "error should use the 'could not read' wording, got: {msg}"
+        );
+        assert!(
+            msg.contains(&path.display().to_string()),
+            "error should name the file, got: {msg}"
+        );
+        assert!(
+            !msg.contains("not found"),
+            "permission errors must not claim the file is missing, got: {msg}"
         );
     }
 
@@ -324,9 +456,9 @@ mod tests {
     #[test]
     fn resolve_vault_explicit_name_hit() {
         let cfg = two_vault_config();
-        let (name, vault) = resolve_vault(&cfg, Some("work")).unwrap();
-        assert_eq!(name, "work");
-        assert_eq!(vault.url, "tailgit:obsidian-work");
+        let resolved = resolve_vault(&cfg, Some("work")).unwrap();
+        assert_eq!(resolved.name, "work");
+        assert_eq!(resolved.vault.url, "tailgit:obsidian-work");
     }
 
     #[test]
@@ -351,8 +483,9 @@ mod tests {
     #[test]
     fn resolve_vault_none_with_one_configured() {
         let cfg = one_vault_config();
-        let (name, _vault) = resolve_vault(&cfg, None).unwrap();
-        assert_eq!(name, "personal");
+        let resolved = resolve_vault(&cfg, None).unwrap();
+        assert_eq!(resolved.name, "personal");
+        assert_eq!(resolved.vault.url, "tailgit:obsidian-personal");
     }
 
     #[test]
@@ -371,10 +504,14 @@ mod tests {
     }
 
     #[test]
-    fn resolve_vault_none_with_zero_configured() {
+    fn resolve_vault_none_with_zero_configured_suggests_init() {
         let cfg = Config::default();
         let err = resolve_vault(&cfg, None).unwrap_err();
-        assert!(err.to_string().contains("no vaults configured"));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no vaults configured; run `tephra init` to add one"),
+            "error should suggest tephra init, got: {msg}"
+        );
     }
 
     #[test]
@@ -440,6 +577,42 @@ mod tests {
 
         let cfg = result.unwrap();
         assert!(cfg.vaults.contains_key("fromxdg"));
+    }
+
+    #[test]
+    fn tephra_config_pointing_at_missing_file_errors_despite_valid_xdg_fallback() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        // A perfectly valid XDG config exists...
+        let dir = tempdir().unwrap();
+        let xdg = dir.path().join("xdg");
+        std::fs::create_dir_all(xdg.join("tephra")).unwrap();
+        write_config(
+            &xdg.join("tephra"),
+            r#"
+            [vaults.fromxdg]
+            bridge = "/tmp/bridge"
+            work = "/tmp/work"
+            url = "tailgit:x"
+            "#,
+        );
+
+        // ...but TEPHRA_CONFIG points at a missing file. An explicit
+        // override must hard-error, never silently fall back.
+        let missing = dir.path().join("missing.toml");
+        std::env::set_var("TEPHRA_CONFIG", &missing);
+        std::env::set_var("XDG_CONFIG_HOME", &xdg);
+
+        let result = load();
+
+        std::env::remove_var("TEPHRA_CONFIG");
+        std::env::remove_var("XDG_CONFIG_HOME");
+
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains(&missing.display().to_string()),
+            "error should name the TEPHRA_CONFIG path, got: {err}"
+        );
     }
 
     #[test]

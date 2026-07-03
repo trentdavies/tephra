@@ -1,6 +1,6 @@
 use clap::{Args, Parser, Subcommand};
 
-mod config;
+use tephra::config;
 
 /// tephra: layered memory for humans and their agents.
 #[derive(Parser)]

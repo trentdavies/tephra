@@ -1,5 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 
+mod config;
+
 /// tephra: layered memory for humans and their agents.
 #[derive(Parser)]
 #[command(name = "tephra", version, about, long_about = None)]
@@ -143,7 +145,22 @@ fn main() {
     let cli = Cli::parse();
     if let Err(err) = run(cli) {
         eprintln!("tephra: {err:#}");
-        std::process::exit(1);
+        std::process::exit(exit_code_for(&err));
+    }
+}
+
+/// Exit-code contract (DESIGN.md §Agent awareness): 0 ok, 1 domain error,
+/// 2 configuration/usage error. Usage errors are identified by
+/// `config::UsageError` anywhere in the error's chain (context wrapping
+/// shouldn't hide it).
+fn exit_code_for(err: &anyhow::Error) -> i32 {
+    let is_usage = err
+        .chain()
+        .any(|cause| cause.downcast_ref::<config::UsageError>().is_some());
+    if is_usage {
+        2
+    } else {
+        1
     }
 }
 
@@ -218,4 +235,31 @@ fn cmd_obsidian_service_install(_vault: Option<String>) -> anyhow::Result<()> {
 
 fn cmd_doctor(_vault: Option<String>) -> anyhow::Result<()> {
     anyhow::bail!("not implemented")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Context;
+
+    #[test]
+    fn plain_error_exits_1() {
+        let err = anyhow::anyhow!("boom");
+        assert_eq!(exit_code_for(&err), 1);
+    }
+
+    #[test]
+    fn usage_error_exits_2() {
+        let err: anyhow::Error = config::UsageError("bad config".to_string()).into();
+        assert_eq!(exit_code_for(&err), 2);
+    }
+
+    #[test]
+    fn usage_error_wrapped_in_context_still_exits_2() {
+        let err: anyhow::Error =
+            Err::<(), anyhow::Error>(config::UsageError("bad config".to_string()).into())
+                .context("while loading config")
+                .unwrap_err();
+        assert_eq!(exit_code_for(&err), 2);
+    }
 }

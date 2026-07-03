@@ -54,6 +54,16 @@ fn bridge_upstream_resolves_to_origin_main() {
 }
 
 #[test]
+fn bridge_remotes_lists_origin() {
+    let fx = Fixture::new("testvault");
+
+    assert_eq!(
+        gitx::remotes(&fx.bridge).unwrap(),
+        vec!["origin".to_string()]
+    );
+}
+
+#[test]
 fn conflicted_paths_reports_unicode_add_add_conflict() {
     let fx = Fixture::new("testvault");
     let filename = "Café ☕.md";
@@ -75,14 +85,29 @@ fn conflicted_paths_reports_unicode_add_add_conflict() {
     );
 
     git_ok(&fx, &fx.bridge, &["fetch", "--quiet", "origin"]);
+    assert!(
+        !gitx::merge_in_progress(&fx.bridge).unwrap(),
+        "no merge should be in progress before merging"
+    );
+
     let merge = fx.git(&fx.bridge, &["merge", "--no-edit", "origin/main"]);
     assert!(
         !merge.status.success(),
         "expected an add/add merge conflict, but merge succeeded"
     );
 
+    assert!(
+        gitx::merge_in_progress(&fx.bridge).unwrap(),
+        "conflicted merge should leave MERGE_HEAD present"
+    );
+
     let conflicted = gitx::conflicted_paths(&fx.bridge).unwrap();
     assert_eq!(conflicted, vec![PathBuf::from(filename)]);
 
     git_ok(&fx, &fx.bridge, &["merge", "--abort"]);
+
+    assert!(
+        !gitx::merge_in_progress(&fx.bridge).unwrap(),
+        "merge --abort should clear MERGE_HEAD"
+    );
 }

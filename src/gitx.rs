@@ -20,12 +20,35 @@ use anyhow::{Context, Result};
 /// Run `git -C <dir> <args...>`, capturing stdout/stderr. Never errors on a
 /// nonzero exit — callers that care about success should inspect
 /// `output.status`, or use [`run_ok`].
+///
+/// Environment shaping applied to the child:
+///
+/// - `LC_ALL=C` / `LANGUAGE=C`, unconditionally: tephra matches on git's
+///   stderr text in places (e.g. [`upstream`]'s "no upstream" detection),
+///   and gettext-localized git builds (Debian, Homebrew) would otherwise
+///   translate those messages. This pins message language only; it has no
+///   behavioral effect on git itself.
+/// - `GIT_TERMINAL_PROMPT=0` and `GIT_SSH_COMMAND=ssh -o BatchMode=yes`,
+///   each set **only when absent from tephra's own environment**: a daemon
+///   must never block on an interactive credential prompt, and ssh reads
+///   from /dev/tty directly, so merely closing stdin doesn't prevent the
+///   hang. The absent-only condition is the escape hatch — a user who
+///   deliberately exports either variable (e.g. a custom `GIT_SSH_COMMAND`
+///   with a specific key or jump host) keeps their value untouched.
 pub fn run(dir: &Path, args: &[&str]) -> Result<Output> {
-    Command::new("git")
-        .arg("-C")
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
         .arg(dir)
         .args(args)
-        .output()
+        .env("LC_ALL", "C")
+        .env("LANGUAGE", "C");
+    if std::env::var_os("GIT_TERMINAL_PROMPT").is_none() {
+        cmd.env("GIT_TERMINAL_PROMPT", "0");
+    }
+    if std::env::var_os("GIT_SSH_COMMAND").is_none() {
+        cmd.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+    }
+    cmd.output()
         .with_context(|| format!("failed to execute `{}`", command_line(dir, args)))
 }
 
@@ -34,15 +57,21 @@ pub fn run(dir: &Path, args: &[&str]) -> Result<Output> {
 pub fn run_ok(dir: &Path, args: &[&str]) -> Result<Output> {
     let output = run(dir, args)?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "`{}` failed ({}): {}",
-            command_line(dir, args),
-            output.status,
-            stderr.trim()
-        );
+        return Err(command_failed(dir, args, &output));
     }
     Ok(output)
+}
+
+/// Build the standard "`<cmd>` failed (<status>): <trimmed stderr>" error
+/// for a nonzero git exit.
+fn command_failed(dir: &Path, args: &[&str], output: &Output) -> anyhow::Error {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    anyhow::anyhow!(
+        "`{}` failed ({}): {}",
+        command_line(dir, args),
+        output.status,
+        stderr.trim()
+    )
 }
 
 fn command_line(dir: &Path, args: &[&str]) -> String {
@@ -102,12 +131,7 @@ pub fn upstream(dir: &Path, branch: &str) -> Result<Option<(String, String)>> {
         if stderr.to_lowercase().contains("no upstream") {
             return Ok(None);
         }
-        anyhow::bail!(
-            "`{}` failed ({}): {}",
-            command_line(dir, &args),
-            output.status,
-            stderr.trim()
-        );
+        return Err(command_failed(dir, &args, &output));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -125,6 +149,27 @@ fn split_upstream(s: &str) -> Option<(String, String)> {
         return None;
     }
     Some((remote.to_string(), branch.to_string()))
+}
+
+/// Configured remote names, via `git remote` (one per line). Empty vec for
+/// a repo with no remotes.
+pub fn remotes(dir: &Path) -> Result<Vec<String>> {
+    let output = run_ok(dir, &["remote"])?;
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Whether a merge is in progress (MERGE_HEAD exists), via
+/// `git rev-parse -q --verify MERGE_HEAD`. Asking git — rather than
+/// path-joining `.git/MERGE_HEAD` ourselves — stays correct for worktrees
+/// and any other layout where `.git` isn't a plain directory, and the exit
+/// code is locale-independent.
+pub fn merge_in_progress(dir: &Path) -> Result<bool> {
+    let output = run(dir, &["rev-parse", "-q", "--verify", "MERGE_HEAD"])?;
+    Ok(output.status.success())
 }
 
 #[cfg(test)]
@@ -180,6 +225,20 @@ mod tests {
                 PathBuf::from("Caf\u{e9} \u{2615}.md"),
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_nul_paths_preserves_invalid_utf8_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+
+        // Unix filenames are arbitrary bytes; a path that isn't valid UTF-8
+        // must survive round-tripping without lossy replacement.
+        let input = b"good.md\0bad_\xffname.md\0";
+        let parsed = parse_nul_paths(input);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0], PathBuf::from("good.md"));
+        assert_eq!(parsed[1].as_os_str().as_bytes(), b"bad_\xffname.md");
     }
 
     // --- run / run_ok against a real git binary ---
@@ -238,5 +297,39 @@ mod tests {
         )
         .unwrap();
         assert_eq!(upstream(dir.path(), "main").unwrap(), None);
+    }
+
+    #[test]
+    fn remotes_is_empty_for_repo_with_no_remotes() {
+        let dir = tempdir().unwrap();
+        run_ok(dir.path(), &["init", "--quiet"]).unwrap();
+        assert_eq!(remotes(dir.path()).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn remotes_lists_configured_remotes() {
+        let dir = tempdir().unwrap();
+        run_ok(dir.path(), &["init", "--quiet"]).unwrap();
+        run_ok(
+            dir.path(),
+            &["remote", "add", "origin", "/nonexistent/remote.git"],
+        )
+        .unwrap();
+        run_ok(
+            dir.path(),
+            &["remote", "add", "backup", "/nonexistent/backup.git"],
+        )
+        .unwrap();
+        assert_eq!(
+            remotes(dir.path()).unwrap(),
+            vec!["backup".to_string(), "origin".to_string()]
+        );
+    }
+
+    #[test]
+    fn merge_in_progress_is_false_in_fresh_repo() {
+        let dir = tempdir().unwrap();
+        run_ok(dir.path(), &["init", "--quiet"]).unwrap();
+        assert!(!merge_in_progress(dir.path()).unwrap());
     }
 }

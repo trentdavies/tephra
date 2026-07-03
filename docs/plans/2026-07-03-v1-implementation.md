@@ -14,6 +14,8 @@
 
 **Repo:** `~/dev/wip/tephra`, branch `main` (pre-0.1 — direct commits to main are fine; no force-push).
 
+**Verification-as-artifact rule:** anything verified during development must be committed as a repeatable check — unit test, integration test, golden file, or e2e assertion. Manual-only verification is a plan violation. The e2e layer (Task 12) senses system state exclusively through tephra's own `status --json` / `doctor` output plus git plumbing — the CLI's observability surface IS the sensor contract, and e2e failures that require richer sensing mean the CLI needs a better sensor, not the test a workaround.
+
 ---
 
 ### Task 1: Cargo scaffold + CI
@@ -107,6 +109,25 @@
 - [ ] `tephra doctor [VAULT]`: git ≥ 2.36; config parses; bridge exists + is a git repo + upstream resolves; `git -C bridge var GIT_COMMITTER_IDENT` resolves (catches the useConfigOnly/identity gap); remote reachable (`git ls-remote --heads`, 10 s timeout via `GIT_SSH_COMMAND=ssh -o ConnectTimeout=10`); stale lock/failcount report. Each check pass/warn/fail + remediation; exit 1 on any fail.
 - [ ] Tests: init non-interactive writes valid config, merge/dup behavior; doctor against fixture (healthy) and with upstream removed (fails with named check).
 - [ ] Commit `feat: init and doctor`.
+
+### Task 12: docker clean-room e2e
+
+**Files:** `e2e/Dockerfile.remote` (sshd + git, a throwaway "tailgit"), `e2e/Dockerfile.tephra` (rust build stage → runtime with git+ssh client), `e2e/compose.yml`, `e2e/scenario.sh` (orchestrator), `e2e/human-sim.sh` (the external-synchronizer simulator), `.github/workflows/e2e.yml` (ubuntu only; docker unavailable on macOS runners).
+
+The point: prove the whole system converges in a clean room no host state can contaminate — git-over-ssh remote like production, a **human/sync simulator** writing and deleting files in the bridge directory out-of-band exactly the way Obsidian Sync does (tephra can't tell the difference), and an agent container pushing through `tephra sync`.
+
+- [ ] `remote` service: openssh-server, single `git` user with an authorized key baked in (throwaway keypair generated at build — clean room, no real keys), bare repo `vault.git` created on init.
+- [ ] `tephra` service: builds the workspace binary (multi-stage), configures `~/.config/tephra/config.toml` for vault `e2e` (url `git@remote:vault.git`), clones bridge + work, runs `tephra bridge --watch --interval 5`.
+- [ ] `e2e/human-sim.sh`: loop writing timestamped edits to existing notes, creating notes (incl. unicode `Café ☕.md`), and deleting notes directly in the bridge dir at randomized 1–7 s intervals — the "external synchronizer" stand-in.
+- [ ] `e2e/scenario.sh` phases, each with explicit sensed assertions (`tephra status --json` + `git ls-remote`/`git log` on the remote):
+  1. **Convergence**: human-sim + agent (`tephra sync` loop in the container writing `agents/*.md`) run concurrently 60 s; stop both; settle 2 cycles; assert remote HEAD == bridge HEAD, zero dirty files, both streams' commits present (`vault: human edits` and `memory:` subjects interleaved).
+  2. **Conflict**: scripted same-file simultaneous edit; assert human content in place + `* (agent conflict *)` copy on the remote with agent content.
+  3. **Outage**: `docker compose pause remote` (or network disconnect) during active human-sim; assert failcount rises via bridge status sensing, commits queue; unpause; assert failcount cleared and queued commits reach the remote.
+  4. **Crash**: `kill -9` the watch process mid-activity; restart; assert no conflict markers anywhere in HEAD (`git grep -l '<<<<<<<'` empty), lock recovered, convergence resumes.
+- [ ] Exit non-zero on any assertion failure with a labeled dump (`status --json`, last 30 log lines).
+- [ ] `.github/workflows/e2e.yml`: build + `docker compose run scenario` on push/PR, ubuntu-latest.
+- [ ] Local run documented in README (Task 11 picks it up): `cd e2e && docker compose up --build --abort-on-container-exit`.
+- [ ] Commit `test: docker clean-room e2e with sync simulator`.
 
 ### Task 11: docs, polish, 0.1.0
 

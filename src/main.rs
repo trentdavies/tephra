@@ -1,6 +1,6 @@
 use clap::{Args, Parser, Subcommand};
 
-use tephra::config;
+use tephra::{bridge, config};
 
 /// tephra: layered memory for humans and their agents.
 #[derive(Parser)]
@@ -193,8 +193,13 @@ fn cmd_init() -> anyhow::Result<()> {
     anyhow::bail!("not implemented")
 }
 
-fn cmd_bridge(_mode: BridgeMode, _vault: Option<String>) -> anyhow::Result<()> {
-    anyhow::bail!("not implemented")
+fn cmd_bridge(mode: BridgeMode, vault: Option<String>) -> anyhow::Result<()> {
+    if mode.watch {
+        anyhow::bail!("not implemented");
+    }
+    let cfg = config::load()?;
+    let resolved = config::resolve_vault(&cfg, vault.as_deref())?;
+    bridge::run_once(resolved.name, resolved.vault)
 }
 
 fn cmd_clone(_vault: Option<String>) -> anyhow::Result<()> {

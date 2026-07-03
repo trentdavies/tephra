@@ -75,6 +75,8 @@ pub struct Fixture {
     /// Path to the generated `config.toml` (set as `TEPHRA_CONFIG` by
     /// [`Fixture::tephra_cmd`]).
     pub config: PathBuf,
+    /// The configured vault name, as passed to [`Fixture::new`].
+    pub name: String,
 }
 
 impl Fixture {
@@ -125,6 +127,7 @@ impl Fixture {
             bridge,
             agent,
             config,
+            name: vault_name.to_string(),
         }
     }
 
@@ -145,6 +148,13 @@ impl Fixture {
         for (key, value) in GIT_ENV {
             cmd.env(key, value);
         }
+        cmd
+    }
+
+    /// A `tephra bridge --once <name>` invocation against this fixture.
+    pub fn bridge_once(&self) -> assert_cmd::Command {
+        let mut cmd = self.tephra_cmd();
+        cmd.arg("bridge").arg("--once").arg(&self.name);
         cmd
     }
 }

@@ -3,5 +3,7 @@
 //! git repositories, in addition to driving the compiled `tephra` binary
 //! end-to-end for CLI-level behavior.
 
+pub mod bridge;
 pub mod config;
 pub mod gitx;
+pub mod notify;

@@ -1,0 +1,63 @@
+# e2e/Dockerfile.tephra — builds the tephra binary and packages it with a
+# throwaway ed25519 keypair + git/ssh client for the clean-room e2e
+# (docs/plans/2026-07-03-v1-implementation.md Task 12).
+#
+# Build context is the repo root (see e2e/compose.yml): the builder stage
+# needs Cargo.toml/Cargo.lock/src/templates.
+#
+# Runtime base matches the builder's Debian release (trixie) so the
+# compiled binary isn't linked against a newer glibc than the runtime image
+# ships -- a real hazard when a multi-stage build's stages don't share a
+# base release.
+FROM rust:1-slim AS builder
+WORKDIR /app
+
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY templates ./templates
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/app/target \
+    cargo build --release --locked \
+    && cp target/release/tephra /usr/local/bin/tephra
+
+FROM debian:trixie-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        git \
+        openssh-client \
+        jq \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/local/bin/tephra /usr/local/bin/tephra
+
+# Throwaway keypair, generated fresh at every build of this image. This is
+# the ONLY copy of the private key; it is baked into this local/CI-only
+# test image and is never a real credential -- see the e2e report /
+# Dockerfile.remote's header comment for how the public half reaches the
+# `remote` container without ever committing key material anywhere.
+RUN mkdir -p /root/.ssh \
+    && ssh-keygen -q -t ed25519 -N "" -f /root/.ssh/id_ed25519 -C tephra-e2e \
+    && chmod 700 /root/.ssh \
+    && chmod 600 /root/.ssh/id_ed25519 \
+    && printf 'Host remote\n  User git\n  IdentityFile /root/.ssh/id_ed25519\n  StrictHostKeyChecking accept-new\n  UserKnownHostsFile /root/.ssh/known_hosts\n' > /root/.ssh/config \
+    && chmod 600 /root/.ssh/config
+
+RUN git config --global user.name "tephra e2e" \
+    && git config --global user.email "e2e@tephra.test" \
+    && git config --global init.defaultBranch main \
+    && git config --global commit.gpgsign false
+
+COPY e2e/human-sim.sh /e2e/human-sim.sh
+COPY e2e/scenario.sh /e2e/scenario.sh
+RUN chmod +x /e2e/human-sim.sh /e2e/scenario.sh
+
+# Explicit, not relied-upon-implicit: tephra's own config resolution
+# (src/config.rs) falls back to `dirs::home_dir()` when neither
+# $TEPHRA_CONFIG nor $XDG_CONFIG_HOME is set, and bails with a config error
+# if that can't be resolved -- don't leave it to chance whether the base
+# image's default container environment exports $HOME for root.
+ENV HOME=/root
+WORKDIR /root
+CMD ["/e2e/scenario.sh"]

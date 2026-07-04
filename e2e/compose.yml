@@ -1,0 +1,32 @@
+# e2e/compose.yml — tephra clean-room e2e
+# (docs/plans/2026-07-03-v1-implementation.md Task 12).
+#
+# Local run: cd e2e && docker compose up --build --abort-on-container-exit \
+#   --exit-code-from scenario
+# Cleanup:   docker compose down -v --remove-orphans
+#
+# No host-platform pinning: both images are multi-arch (debian:trixie-slim,
+# rust:1-slim), so this builds arm64 natively here and amd64 in CI without
+# any --platform override.
+name: tephra-e2e
+
+services:
+  remote:
+    build:
+      context: .
+      dockerfile: Dockerfile.remote
+    volumes:
+      - shared:/shared
+
+  scenario:
+    build:
+      context: ..
+      dockerfile: e2e/Dockerfile.tephra
+    depends_on:
+      remote:
+        condition: service_healthy
+    volumes:
+      - shared:/shared
+
+volumes:
+  shared:

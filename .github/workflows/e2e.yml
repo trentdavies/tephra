@@ -1,0 +1,26 @@
+name: e2e
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: docker compose build
+        working-directory: e2e
+        run: docker compose build
+      - name: run clean-room e2e
+        working-directory: e2e
+        run: docker compose up --abort-on-container-exit --exit-code-from scenario
+      - name: dump service logs on failure
+        if: failure()
+        working-directory: e2e
+        run: docker compose logs
+      - name: cleanup
+        if: always()
+        working-directory: e2e
+        run: docker compose down -v --remove-orphans

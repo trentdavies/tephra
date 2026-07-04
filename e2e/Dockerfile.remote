@@ -1,0 +1,61 @@
+# e2e/Dockerfile.remote — throwaway git-over-ssh remote for the tephra
+# clean-room e2e (docs/plans/2026-07-03-v1-implementation.md Task 12).
+#
+# This is a disposable, local/CI-only test fixture: the sshd host keys are
+# regenerated on every build and the authorized key it trusts is handed to
+# it at container start by the `scenario` container over a shared volume
+# (see remote-entrypoint.sh) — never a real credential, never committed.
+#
+# Build context is ./e2e (this directory); no access to the workspace
+# source tree is needed here.
+FROM debian:trixie-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        openssh-server \
+        git \
+        netcat-openbsd \
+        procps \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /run/sshd
+
+# Dedicated, unprivileged git user. Plain bash (not git-shell): the
+# sandbox's access control is key-only auth + AllowUsers below, not shell
+# restriction, so there's no need to fight git-shell's path assumptions for
+# a repo that lives outside the user's home directory.
+RUN useradd -m -s /bin/bash git
+
+# Bare repo, HEAD pointed at refs/heads/main before any commit exists, so a
+# fresh clone lands on branch "main" (git resolves the initial branch of a
+# clone from the remote's HEAD symref even when the repo is empty).
+RUN git init --quiet --bare /srv/vault.git \
+    && git -C /srv/vault.git symbolic-ref HEAD refs/heads/main \
+    && chown -R git:git /srv/vault.git
+
+# Key-only, single-user sshd. Host keys are generated fresh at build time
+# (throwaway, container-local, regenerated every build).
+RUN ssh-keygen -A
+RUN { \
+      echo 'PubkeyAuthentication yes'; \
+      echo 'PasswordAuthentication no'; \
+      echo 'ChallengeResponseAuthentication no'; \
+      echo 'KbdInteractiveAuthentication no'; \
+      echo 'UsePAM no'; \
+      echo 'PermitRootLogin no'; \
+      echo 'AllowUsers git'; \
+    } >> /etc/ssh/sshd_config
+
+RUN mkdir -p /home/git/.ssh \
+    && touch /home/git/.ssh/authorized_keys \
+    && chmod 700 /home/git/.ssh \
+    && chmod 600 /home/git/.ssh/authorized_keys \
+    && chown -R git:git /home/git/.ssh
+
+COPY remote-entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+HEALTHCHECK --interval=2s --timeout=2s --start-period=5s --retries=15 \
+    CMD nc -z 127.0.0.1 22 || exit 1
+
+EXPOSE 22
+ENTRYPOINT ["/entrypoint.sh"]

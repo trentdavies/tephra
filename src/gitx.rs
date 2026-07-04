@@ -35,6 +35,9 @@ use anyhow::{Context, Result};
 ///   hang. The absent-only condition is the escape hatch — a user who
 ///   deliberately exports either variable (e.g. a custom `GIT_SSH_COMMAND`
 ///   with a specific key or jump host) keeps their value untouched.
+///
+/// No subprocess timeout: a hung ssh blocks the whole cycle; the service
+/// manager's stop-timeout is the backstop.
 pub fn run(dir: &Path, args: &[&str]) -> Result<Output> {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(dir).args(args);

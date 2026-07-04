@@ -33,7 +33,8 @@ reaches a human device. Conflicts never block and never lose data.
 ```
 tephra init                        register a vault (writes config.toml)
 tephra bridge --once [VAULT]       one merge cycle (what the service invokes)
-tephra bridge --watch [VAULT]      foreground loop (systemd / debugging)
+tephra bridge --watch [VAULT]      foreground loop (for debugging or custom supervisors;
+                                   `service install` uses --once on a timer on both platforms)
 tephra clone [VAULT]               clone the vault repo to the work path
 tephra sync [VAULT] [-m MSG]       commit-all → pull --rebase → push (agent entry point)
 tephra status [VAULT] [--json]     work clone + bridge + service + remote state

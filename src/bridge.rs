@@ -177,7 +177,10 @@ pub fn watch(name: &str, vault: &Vault, requested_interval_secs: u64) -> Result<
 
     let interval = Duration::from_secs(interval_secs);
     loop {
-        run_once(name, vault)?;
+        // The vault tag matters more on this path than in --once: a hard
+        // error ending a long-running watch lands in a journal that may be
+        // shared by several vaults' services, and must say which one died.
+        run_once(name, vault).with_context(|| format!("[tephra-bridge/{name}]"))?;
         if stop.load(Ordering::SeqCst) {
             break;
         }

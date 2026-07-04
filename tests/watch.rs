@@ -150,10 +150,14 @@ fn watch_runs_a_cycle_and_exits_cleanly_on_sigterm() {
         "watch should log a shutdown line on signal exit, got: {stdout:?}"
     );
 
+    // The lock is per-cycle RAII (acquired and dropped inside `run_once`),
+    // so this checks that the completed cycle released it — the shutdown
+    // path itself never holds the lock, since the signal is only acted on
+    // between cycles.
     let lock = fx.bridge.join(".git").join("tephra-bridge.lock");
     assert!(
         !lock.exists(),
-        "the per-cycle lock should be released after shutdown"
+        "the completed cycle's lock should not linger after exit"
     );
 }
 

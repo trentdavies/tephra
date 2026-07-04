@@ -6,7 +6,9 @@
 pub mod agent;
 pub mod bridge;
 pub mod config;
+pub mod doctor;
 pub mod gitx;
+pub mod init;
 pub mod notify;
 pub mod obsidian;
 pub mod service;

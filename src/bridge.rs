@@ -24,7 +24,9 @@ use crate::notify;
 /// `pub(crate)` because `agent::status` reports on the same file.
 pub(crate) const LOCK_DIR_NAME: &str = "tephra-bridge.lock";
 /// A lock dir older than this is assumed abandoned by a crashed run.
-const LOCK_STALE_AFTER: Duration = Duration::from_secs(30 * 60);
+/// `pub(crate)`: `doctor::check_lock_state` reports staleness using this
+/// exact threshold rather than duplicating it.
+pub(crate) const LOCK_STALE_AFTER: Duration = Duration::from_secs(30 * 60);
 /// Failure-counter file name, under `<bridge>/.git/`. Deleted after every
 /// successful fetch and never written as 0, so "absent" means no
 /// consecutive failures. `pub(crate)`: see [`LOCK_DIR_NAME`].

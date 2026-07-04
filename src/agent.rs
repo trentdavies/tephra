@@ -356,7 +356,9 @@ fn last_commit_subject(dir: &Path) -> Option<String> {
     non_empty(String::from_utf8_lossy(&output.stdout).trim())
 }
 
-fn failcount(bridge: &Path) -> Option<u32> {
+/// `pub(crate)`: `doctor::check_failcount` reuses this snapshot helper
+/// rather than duplicating the failcount file's path/parse logic.
+pub(crate) fn failcount(bridge: &Path) -> Option<u32> {
     let path = bridge.join(".git").join(FAILCOUNT_FILE_NAME);
     std::fs::read_to_string(path)
         .ok()
@@ -370,7 +372,9 @@ fn lock_present(bridge: &Path) -> bool {
 /// Parse the bridge's heartbeat file (`<RFC3339 UTC> <outcome>`) into its
 /// `(at, outcome)` halves. `(None, None)` when the file is absent (the
 /// bridge has never completed a cycle) or unreadable.
-fn last_cycle(bridge: &Path) -> (Option<String>, Option<String>) {
+/// `pub(crate)`: `doctor::check_heartbeat` reuses this snapshot helper
+/// rather than duplicating the heartbeat file's path/parse logic.
+pub(crate) fn last_cycle(bridge: &Path) -> (Option<String>, Option<String>) {
     let path = bridge.join(".git").join(LASTCYCLE_FILE_NAME);
     let Ok(text) = std::fs::read_to_string(path) else {
         return (None, None);

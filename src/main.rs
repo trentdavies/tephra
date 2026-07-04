@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
-use tephra::{agent, bridge, config, obsidian, service};
+use tephra::{agent, bridge, config, doctor, init, obsidian, service};
 
 /// tephra: layered memory for humans and their agents.
 #[derive(Parser)]
@@ -15,7 +15,38 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Register a vault (writes config.toml)
-    Init,
+    Init {
+        /// Vault name (prompted if omitted, unless --yes)
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Bridge checkout path (prompted if omitted, unless --yes; default
+        /// ~/dev/memory/bridge-<name>)
+        #[arg(long)]
+        bridge: Option<String>,
+
+        /// Agent work-clone path (prompted if omitted, unless --yes;
+        /// default ~/dev/memory/work-<name>)
+        #[arg(long)]
+        work: Option<String>,
+
+        /// Remote URL (prompted if omitted, unless --yes)
+        #[arg(long)]
+        url: Option<String>,
+
+        /// Branch to track (default "main")
+        #[arg(long)]
+        branch: Option<String>,
+
+        /// Replace an existing vault of the same name
+        #[arg(long)]
+        force: bool,
+
+        /// Fully non-interactive: require --name/--bridge/--work/--url,
+        /// never prompt
+        #[arg(long)]
+        yes: bool,
+    },
 
     /// Run the bridge merge cycle
     Bridge {
@@ -210,7 +241,15 @@ fn exit_code_for(err: &anyhow::Error) -> i32 {
 
 fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
-        Commands::Init => cmd_init(),
+        Commands::Init {
+            name,
+            bridge,
+            work,
+            url,
+            branch,
+            force,
+            yes,
+        } => cmd_init(name, bridge, work, url, branch, force, yes),
         Commands::Bridge { mode, vault } => cmd_bridge(mode, vault),
         Commands::Clone { vault } => cmd_clone(vault),
         Commands::Sync { vault, message } => cmd_sync(vault, message),
@@ -236,8 +275,25 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     }
 }
 
-fn cmd_init() -> anyhow::Result<()> {
-    anyhow::bail!("not implemented")
+#[allow(clippy::too_many_arguments)]
+fn cmd_init(
+    name: Option<String>,
+    bridge: Option<String>,
+    work: Option<String>,
+    url: Option<String>,
+    branch: Option<String>,
+    force: bool,
+    yes: bool,
+) -> anyhow::Result<()> {
+    init::run(init::InitArgs {
+        name,
+        bridge,
+        work,
+        url,
+        branch,
+        force,
+        yes,
+    })
 }
 
 fn cmd_bridge(mode: BridgeMode, vault: Option<String>) -> anyhow::Result<()> {
@@ -320,8 +376,10 @@ fn cmd_obsidian_service_uninstall(vault: Option<String>) -> anyhow::Result<()> {
     obsidian::service_uninstall(resolved.name)
 }
 
-fn cmd_doctor(_vault: Option<String>) -> anyhow::Result<()> {
-    anyhow::bail!("not implemented")
+fn cmd_doctor(vault: Option<String>) -> anyhow::Result<()> {
+    let cfg = config::load()?;
+    let resolved = config::resolve_vault(&cfg, vault.as_deref())?;
+    doctor::doctor(resolved.name, resolved.vault)
 }
 
 #[cfg(test)]

@@ -13,10 +13,16 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// One configured vault: a bridge checkout + agent work-clone pairing.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+///
+/// Derives `Serialize` (in addition to `Deserialize`) so `init` can build a
+/// fresh `Config`/`Vault` and hand it to `toml::to_string_pretty` when
+/// writing a brand-new `config.toml` -- see that module's doc comment for
+/// why a fresh file uses plain `toml` serialization while merging into an
+/// existing one uses `toml_edit` instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Vault {
     /// Bridge checkout path (where the daemon operates).
@@ -35,7 +41,7 @@ fn default_branch() -> String {
 }
 
 /// Top-level config: `[vaults.<name>]` tables.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
@@ -123,7 +129,7 @@ pub fn load_from(path: &Path) -> Result<Config> {
 /// boundary: non-empty, ASCII alphanumeric plus `-`, `_`, and `.` only.
 /// Everything downstream can then trust a loaded config's names (a `/`
 /// would otherwise traverse directories; a space would split tokens).
-fn validate_vault_name(name: &str, config_path: &Path) -> Result<()> {
+pub(crate) fn validate_vault_name(name: &str, config_path: &Path) -> Result<()> {
     if name.is_empty() {
         return usage_err(format!(
             "empty vault name in {}: vault names must be non-empty",
@@ -147,7 +153,7 @@ fn validate_vault_name(name: &str, config_path: &Path) -> Result<()> {
 /// `$TEPHRA_CONFIG` (exact file) if set; else
 /// `$XDG_CONFIG_HOME/tephra/config.toml` if `XDG_CONFIG_HOME` is set; else
 /// `~/.config/tephra/config.toml`.
-fn resolve_config_path() -> Result<PathBuf> {
+pub(crate) fn resolve_config_path() -> Result<PathBuf> {
     if let Ok(p) = std::env::var("TEPHRA_CONFIG") {
         return Ok(PathBuf::from(p));
     }

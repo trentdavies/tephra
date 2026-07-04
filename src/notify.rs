@@ -11,13 +11,14 @@ pub fn notify(title: &str, body: &str) {
     imp::notify(&title, &body);
 }
 
-/// Strip `"` characters from a string bound for an `osascript` literal.
+/// Strip `"` and `\` characters from a string bound for an `osascript`
+/// literal (a trailing backslash would escape the generated closing quote).
 /// Inputs here are strings tephra builds itself (vault names, remote
 /// names), not adversarial input, so simple stripping — rather than full
 /// shell/AppleScript escaping — is enough to keep the generated command
 /// well-formed.
 fn strip_quotes(s: &str) -> String {
-    s.chars().filter(|&c| c != '"').collect()
+    s.chars().filter(|&c| c != '"' && c != '\\').collect()
 }
 
 #[cfg(target_os = "macos")]
@@ -51,6 +52,14 @@ mod tests {
     #[test]
     fn strip_quotes_removes_double_quotes() {
         assert_eq!(strip_quotes(r#"say "hi" now"#), "say hi now");
+    }
+
+    #[test]
+    fn strip_quotes_removes_backslashes() {
+        // A trailing backslash would escape the closing quote of the
+        // generated osascript literal, breaking the whole command.
+        assert_eq!(strip_quotes(r"path\to\vault\"), "pathtovault");
+        assert_eq!(strip_quotes(r#"mix \" of both \"#), "mix  of both ");
     }
 
     #[test]

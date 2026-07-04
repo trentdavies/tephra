@@ -41,9 +41,20 @@ pub fn run_once(name: &str, vault: &Vault) -> Result<()> {
     };
 
     // 1. Abort any half-finished merge from a crashed prior run. Must run
-    // before committing human edits (see module docs).
+    // before committing human edits (see module docs). If the abort itself
+    // fails and MERGE_HEAD is still there, committing would bake conflict
+    // markers into notes as "human edits" — the exact hazard this ordering
+    // exists to prevent — so bail out instead of proceeding.
     if gitx::merge_in_progress(bridge)? {
-        let _ = gitx::run(bridge, &["merge", "--abort"]);
+        let abort = gitx::run(bridge, &["merge", "--abort"])?;
+        if !abort.status.success() && gitx::merge_in_progress(bridge)? {
+            anyhow::bail!(
+                "could not abort the in-progress merge in {}; refusing to commit human \
+                 edits on top of a conflicted tree: {}",
+                bridge.display(),
+                String::from_utf8_lossy(&abort.stderr).trim()
+            );
+        }
     }
 
     // 2. Commit anything the sync app delivered.
@@ -78,8 +89,12 @@ pub fn run_once(name: &str, vault: &Vault) -> Result<()> {
     }
 
     // 6. Push, one bounded retry after a re-fetch/merge (a push race).
-    // Never `--force`.
-    let push = gitx::run(bridge, &["push", "-q", &remote, &vault.branch])?;
+    // Never `--force`. The refspec pushes the local branch to the SAME
+    // remote branch the merge just consumed: pushing bare `vault.branch`
+    // would silently split brain whenever the local branch tracks a
+    // differently-named remote branch (e.g. local main -> origin/master).
+    let refspec = format!("{}:{}", vault.branch, remote_branch);
+    let push = gitx::run(bridge, &["push", "-q", &remote, &refspec])?;
     if !push.status.success() {
         let fetch2 = gitx::run(bridge, &["fetch", "-q", &remote])?;
         if !fetch2.status.success() {
@@ -90,7 +105,7 @@ pub fn run_once(name: &str, vault: &Vault) -> Result<()> {
             let _ = gitx::run(bridge, &["merge", "--abort"]);
             return remote_failed(bridge, name, &remote);
         }
-        let push2 = gitx::run(bridge, &["push", "-q", &remote, &vault.branch])?;
+        let push2 = gitx::run(bridge, &["push", "-q", &remote, &refspec])?;
         if !push2.status.success() {
             return remote_failed(bridge, name, &remote);
         }
@@ -204,9 +219,17 @@ fn resolve_one_conflict(bridge: &Path, path: &Path, stamp: &str, name: &str) {
     let mut copy_rel: Option<PathBuf> = None;
     if let Ok(show) = gitx::run(bridge, &["show", &format!(":3:{path_str}")]) {
         if show.status.success() {
-            let rel = conflict_copy_relpath(path, stamp);
-            if fs::write(bridge.join(&rel), &show.stdout).is_ok() {
-                copy_rel = Some(rel);
+            let rel = conflict_copy_relpath(bridge, path, stamp);
+            match fs::write(bridge.join(&rel), &show.stdout) {
+                Ok(()) => copy_rel = Some(rel),
+                Err(e) => log(
+                    name,
+                    &format!(
+                        "failed to write conflict copy {}: {e}; the agent version is \
+                         still recoverable from the merge's second parent",
+                        rel.display()
+                    ),
+                ),
             }
         }
     }
@@ -226,14 +249,31 @@ fn resolve_one_conflict(bridge: &Path, path: &Path, stamp: &str, name: &str) {
 }
 
 /// Build the sibling conflict-copy path for a conflicted repo-relative
-/// path: `<stem> (agent conflict YYYY-MM-DD).md` for `.md` files,
-/// `<full-name>.agent-conflict-YYYY-MM-DD` otherwise. Any directory prefix
-/// is preserved.
-fn conflict_copy_relpath(path: &Path, stamp: &str) -> PathBuf {
+/// path, uniquified against files already on disk in the bridge: a second
+/// conflict on the same file on the same day must not clobber the first
+/// preserved copy, so taken names get a ` (2)`, ` (3)`, ... counter.
+fn conflict_copy_relpath(bridge: &Path, path: &Path, stamp: &str) -> PathBuf {
+    (1u32..)
+        .map(|n| conflict_copy_candidate(path, stamp, n))
+        .find(|rel| !bridge.join(rel).exists())
+        .expect("some conflict-copy counter value is always free")
+}
+
+/// The `n`-th candidate name for a conflict copy:
+/// `<stem> (agent conflict YYYY-MM-DD).md` for `.md` files,
+/// `<full-name>.agent-conflict-YYYY-MM-DD` otherwise; `n > 1` appends a
+/// ` (n)` counter before the `.md` extension (or at the end for non-`.md`
+/// files). Any directory prefix is preserved.
+fn conflict_copy_candidate(path: &Path, stamp: &str, n: u32) -> PathBuf {
     let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let counter = if n <= 1 {
+        String::new()
+    } else {
+        format!(" ({n})")
+    };
     let copy_name = match file_name.strip_suffix(".md") {
-        Some(stem) => format!("{stem} (agent conflict {stamp}).md"),
-        None => format!("{file_name}.agent-conflict-{stamp}"),
+        Some(stem) => format!("{stem} (agent conflict {stamp}){counter}.md"),
+        None => format!("{file_name}.agent-conflict-{stamp}{counter}"),
     };
     match path.parent() {
         Some(parent) if parent != Path::new("") => parent.join(copy_name),
@@ -251,11 +291,11 @@ fn failcount_path(bridge: &Path) -> PathBuf {
 /// hard (nonzero-exit) error.
 fn remote_failed(bridge: &Path, name: &str, remote: &str) -> Result<()> {
     let path = failcount_path(bridge);
-    let n: u32 = fs::read_to_string(&path)
+    let n = fs::read_to_string(&path)
         .ok()
         .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0)
-        + 1;
+        .unwrap_or(0u32)
+        .saturating_add(1);
     fs::write(&path, n.to_string()).with_context(|| format!("writing {}", path.display()))?;
     log(name, &format!("remote unreachable (attempt {n})"));
     if n == NOTIFY_AFTER {
@@ -354,20 +394,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn conflict_copy_relpath_for_md_file() {
-        let got = conflict_copy_relpath(Path::new("Home.md"), "2026-07-03");
+    fn conflict_copy_candidate_for_md_file() {
+        let got = conflict_copy_candidate(Path::new("Home.md"), "2026-07-03", 1);
         assert_eq!(got, PathBuf::from("Home (agent conflict 2026-07-03).md"));
     }
 
     #[test]
-    fn conflict_copy_relpath_for_non_md_file() {
-        let got = conflict_copy_relpath(Path::new("notes.txt"), "2026-07-03");
+    fn conflict_copy_candidate_for_non_md_file() {
+        let got = conflict_copy_candidate(Path::new("notes.txt"), "2026-07-03", 1);
         assert_eq!(got, PathBuf::from("notes.txt.agent-conflict-2026-07-03"));
     }
 
     #[test]
-    fn conflict_copy_relpath_preserves_directory_prefix() {
-        let got = conflict_copy_relpath(Path::new("agents/log.md"), "2026-07-03");
+    fn conflict_copy_candidate_preserves_directory_prefix() {
+        let got = conflict_copy_candidate(Path::new("agents/log.md"), "2026-07-03", 1);
         assert_eq!(
             got,
             PathBuf::from("agents/log (agent conflict 2026-07-03).md")
@@ -375,9 +415,94 @@ mod tests {
     }
 
     #[test]
-    fn conflict_copy_relpath_handles_unicode_stem() {
-        let got = conflict_copy_relpath(Path::new("Café ☕.md"), "2026-07-03");
+    fn conflict_copy_candidate_handles_unicode_stem() {
+        let got = conflict_copy_candidate(Path::new("Café ☕.md"), "2026-07-03", 1);
         assert_eq!(got, PathBuf::from("Café ☕ (agent conflict 2026-07-03).md"));
+    }
+
+    #[test]
+    fn conflict_copy_candidate_counter_goes_before_md_extension() {
+        let got = conflict_copy_candidate(Path::new("Home.md"), "2026-07-03", 2);
+        assert_eq!(
+            got,
+            PathBuf::from("Home (agent conflict 2026-07-03) (2).md")
+        );
+    }
+
+    #[test]
+    fn conflict_copy_candidate_counter_appends_for_non_md() {
+        let got = conflict_copy_candidate(Path::new("notes.txt"), "2026-07-03", 3);
+        assert_eq!(
+            got,
+            PathBuf::from("notes.txt.agent-conflict-2026-07-03 (3)")
+        );
+    }
+
+    #[test]
+    fn conflict_copy_relpath_uniquifies_against_existing_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = conflict_copy_relpath(dir.path(), Path::new("Home.md"), "2026-07-03");
+        assert_eq!(first, PathBuf::from("Home (agent conflict 2026-07-03).md"));
+
+        fs::write(dir.path().join(&first), "occupied").unwrap();
+        let second = conflict_copy_relpath(dir.path(), Path::new("Home.md"), "2026-07-03");
+        assert_eq!(
+            second,
+            PathBuf::from("Home (agent conflict 2026-07-03) (2).md")
+        );
+
+        fs::write(dir.path().join(&second), "occupied").unwrap();
+        let third = conflict_copy_relpath(dir.path(), Path::new("Home.md"), "2026-07-03");
+        assert_eq!(
+            third,
+            PathBuf::from("Home (agent conflict 2026-07-03) (3).md")
+        );
+    }
+
+    /// A bridge-shaped tempdir (has a `.git` subdir) for exercising the
+    /// failcount paths without a full git fixture.
+    fn fake_bridge() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn remote_failed_saturates_at_u32_max_instead_of_panicking() {
+        let dir = fake_bridge();
+        fs::write(failcount_path(dir.path()), u32::MAX.to_string()).unwrap();
+
+        remote_failed(dir.path(), "t", "origin").unwrap();
+
+        assert_eq!(
+            fs::read_to_string(failcount_path(dir.path())).unwrap(),
+            u32::MAX.to_string(),
+            "the counter must saturate, not overflow"
+        );
+    }
+
+    #[test]
+    fn remote_failed_treats_corrupt_failcount_as_zero() {
+        let dir = fake_bridge();
+        fs::write(failcount_path(dir.path()), "not a number\n").unwrap();
+
+        remote_failed(dir.path(), "t", "origin").unwrap();
+
+        assert_eq!(
+            fs::read_to_string(failcount_path(dir.path())).unwrap(),
+            "1",
+            "a corrupt counter file should restart the count at 1"
+        );
+    }
+
+    #[test]
+    fn remote_failed_increments_existing_count() {
+        let dir = fake_bridge();
+        fs::write(failcount_path(dir.path()), "3").unwrap();
+
+        remote_failed(dir.path(), "t", "origin").unwrap();
+
+        assert_eq!(fs::read_to_string(failcount_path(dir.path())).unwrap(), "4");
     }
 
     #[test]

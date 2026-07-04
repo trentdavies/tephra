@@ -53,19 +53,31 @@ fn rev_parse(fx: &Fixture, dir: &Path, rev: &str) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
+/// All conflict-copy files created alongside conflicted notes, whatever
+/// today's date stamp happens to be, in sorted order.
+fn find_conflict_copies(dir: &Path) -> Vec<PathBuf> {
+    let mut copies: Vec<PathBuf> = fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.contains("agent conflict") || n.contains("agent-conflict"))
+                        .unwrap_or(false)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    copies.sort();
+    copies
+}
+
 /// Find a conflict-copy file created alongside a conflicted note, whatever
 /// today's date stamp happens to be.
 fn find_conflict_copy(dir: &Path) -> Option<PathBuf> {
-    fs::read_dir(dir)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.contains("agent conflict") || n.contains("agent-conflict"))
-                .unwrap_or(false)
-        })
+    find_conflict_copies(dir).into_iter().next()
 }
 
 fn failcount_path(fx: &Fixture) -> PathBuf {
@@ -149,6 +161,12 @@ fn same_file_conflict_human_wins_agent_copy_preserved() {
     assert!(
         copy_content.contains("AGENT VERSION"),
         "harness test 3: agent-conflict copy should contain the agent's version, got: {copy_content:?}"
+    );
+
+    assert_eq!(
+        rev_parse(&fx, &fx.bridge, "HEAD"),
+        rev_parse(&fx, &fx.remote, "main"),
+        "harness test 3: the resolved merge should be pushed to the remote"
     );
 }
 
@@ -235,9 +253,12 @@ fn offline_remote_queues_commit_and_bumps_failcount_then_recovers_on_reconnect()
         "vault: human edits",
         "harness test 4b: the offline edit should still be committed locally"
     );
-    assert!(
-        failcount_path(&fx).exists(),
-        "harness test 4c: a failure counter file should exist after an unreachable remote"
+    let failcount = fs::read_to_string(failcount_path(&fx))
+        .expect("harness test 4c: a failure counter file should exist after an unreachable remote");
+    assert_eq!(
+        failcount.trim(),
+        "1",
+        "harness test 4c: a first remote failure should record a count of exactly 1"
     );
 
     fs::rename(&gone, &fx.remote).expect("restore remote.git");
@@ -321,6 +342,120 @@ fn stale_merge_head_is_aborted_before_human_edits_are_committed() {
         rev_parse(&fx, &fx.bridge, "HEAD"),
         rev_parse(&fx, &fx.remote, "main"),
         "scenario 13: the recovered merge should be pushed to the remote"
+    );
+}
+
+// --- push refspec honors the upstream's remote branch name ---------------
+// The merge already targets `<remote>/<remote_branch>` from the upstream;
+// the push must send `<local_branch>:<remote_branch>` too, or a bridge
+// whose local main tracks e.g. origin/master silently splits brain: it
+// merges from master but pushes to a remote main nobody reads.
+
+#[test]
+fn push_targets_upstream_remote_branch_not_local_branch_name() {
+    let fx = Fixture::new("testvault");
+
+    // Remote grows a `master` branch; the bridge's local `main` tracks it.
+    git_ok(&fx, &fx.remote, &["branch", "master", "main"]);
+    let remote_main_before = rev_parse(&fx, &fx.remote, "main");
+    git_ok(&fx, &fx.bridge, &["fetch", "--quiet", "origin"]);
+    git_ok(
+        &fx,
+        &fx.bridge,
+        &["branch", "--set-upstream-to=origin/master", "main"],
+    );
+
+    append_line(&fx.bridge.join("Home.md"), "human line");
+
+    fx.bridge_once().assert().success();
+
+    let master_subject = fx.git(&fx.remote, &["log", "master", "-1", "--format=%s"]);
+    assert_eq!(
+        String::from_utf8_lossy(&master_subject.stdout).trim(),
+        "vault: human edits",
+        "the human commit should land on the remote's tracked branch (master)"
+    );
+    assert_eq!(
+        rev_parse(&fx, &fx.bridge, "HEAD"),
+        rev_parse(&fx, &fx.remote, "master"),
+        "bridge HEAD should be pushed to remote master, the upstream's branch"
+    );
+    assert_eq!(
+        rev_parse(&fx, &fx.remote, "main"),
+        remote_main_before,
+        "remote main must be untouched when the upstream tracks master"
+    );
+}
+
+// --- same-day repeat conflict must not clobber the earlier copy ---------
+
+#[test]
+fn same_day_repeat_conflict_preserves_both_agent_versions() {
+    let fx = Fixture::new("testvault");
+
+    // Round 1: conflicting edits to Home.md.
+    fs::write(fx.agent.join("Home.md"), "AGENT V1\n").unwrap();
+    git_ok(&fx, &fx.agent, &["add", "-A"]);
+    git_ok(&fx, &fx.agent, &["commit", "--quiet", "-m", "memory: v1"]);
+    git_ok(&fx, &fx.agent, &["push", "--quiet", "origin", "main"]);
+    fs::write(fx.bridge.join("Home.md"), "HUMAN V1\n").unwrap();
+
+    fx.bridge_once().assert().success();
+
+    // Round 2, same day: another conflicting edit to the same file.
+    git_ok(&fx, &fx.agent, &["pull", "--quiet"]);
+    fs::write(fx.agent.join("Home.md"), "AGENT V2\n").unwrap();
+    git_ok(&fx, &fx.agent, &["add", "-A"]);
+    git_ok(&fx, &fx.agent, &["commit", "--quiet", "-m", "memory: v2"]);
+    git_ok(&fx, &fx.agent, &["push", "--quiet", "origin", "main"]);
+    fs::write(fx.bridge.join("Home.md"), "HUMAN V2\n").unwrap();
+
+    fx.bridge_once().assert().success();
+
+    let copies = find_conflict_copies(&fx.bridge);
+    assert_eq!(
+        copies.len(),
+        2,
+        "both same-day conflicts should leave distinct copies, got: {copies:?}"
+    );
+    let contents: Vec<String> = copies
+        .iter()
+        .map(|p| fs::read_to_string(p).unwrap())
+        .collect();
+    assert!(
+        contents.iter().any(|c| c.contains("AGENT V1")),
+        "the first agent version must survive the second same-day conflict, got: {contents:?}"
+    );
+    assert!(
+        contents.iter().any(|c| c.contains("AGENT V2")),
+        "the second agent version should be preserved too, got: {contents:?}"
+    );
+}
+
+// --- an unabortable stale merge must error, never commit human edits ----
+// If MERGE_HEAD exists and `git merge --abort` fails, proceeding to the
+// "vault: human edits" commit is exactly the marker-baking hazard the
+// abort-first ordering exists to prevent. Fabricate the state with a valid
+// MERGE_HEAD plus a stale index.lock that blocks the abort.
+
+#[test]
+fn unabortable_stale_merge_errors_instead_of_committing_human_edits() {
+    let fx = Fixture::new("testvault");
+
+    let head = rev_parse(&fx, &fx.bridge, "HEAD");
+    fs::write(fx.bridge.join(".git/MERGE_HEAD"), format!("{head}\n")).unwrap();
+    fs::write(fx.bridge.join(".git/index.lock"), "").unwrap();
+    append_line(&fx.bridge.join("Home.md"), "dirty human edit");
+
+    fx.bridge_once()
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("abort"));
+
+    assert_ne!(
+        last_commit_subject(&fx, &fx.bridge),
+        "vault: human edits",
+        "human edits must not be committed while an unabortable merge is in progress"
     );
 }
 

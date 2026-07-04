@@ -1,6 +1,6 @@
 use clap::{Args, Parser, Subcommand};
 
-use tephra::{bridge, config};
+use tephra::{agent, bridge, config};
 
 /// tephra: layered memory for humans and their agents.
 #[derive(Parser)]
@@ -202,16 +202,22 @@ fn cmd_bridge(mode: BridgeMode, vault: Option<String>) -> anyhow::Result<()> {
     bridge::run_once(resolved.name, resolved.vault)
 }
 
-fn cmd_clone(_vault: Option<String>) -> anyhow::Result<()> {
-    anyhow::bail!("not implemented")
+fn cmd_clone(vault: Option<String>) -> anyhow::Result<()> {
+    let cfg = config::load()?;
+    let resolved = config::resolve_vault(&cfg, vault.as_deref())?;
+    agent::clone(resolved.vault)
 }
 
-fn cmd_sync(_vault: Option<String>, _message: Option<String>) -> anyhow::Result<()> {
-    anyhow::bail!("not implemented")
+fn cmd_sync(vault: Option<String>, message: Option<String>) -> anyhow::Result<()> {
+    let cfg = config::load()?;
+    let resolved = config::resolve_vault(&cfg, vault.as_deref())?;
+    agent::sync(resolved.name, resolved.vault, message.as_deref())
 }
 
-fn cmd_status(_vault: Option<String>, _json: bool) -> anyhow::Result<()> {
-    anyhow::bail!("not implemented")
+fn cmd_status(vault: Option<String>, json: bool) -> anyhow::Result<()> {
+    let cfg = config::load()?;
+    let resolved = config::resolve_vault(&cfg, vault.as_deref())?;
+    agent::status(resolved.name, resolved.vault, json)
 }
 
 fn cmd_service_install(_vault: Option<String>) -> anyhow::Result<()> {

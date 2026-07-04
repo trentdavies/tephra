@@ -37,19 +37,49 @@ use anyhow::{Context, Result};
 ///   with a specific key or jump host) keeps their value untouched.
 pub fn run(dir: &Path, args: &[&str]) -> Result<Output> {
     let mut cmd = Command::new("git");
-    cmd.arg("-C")
-        .arg(dir)
-        .args(args)
-        .env("LC_ALL", "C")
-        .env("LANGUAGE", "C");
+    cmd.arg("-C").arg(dir).args(args);
+    shape_env(&mut cmd);
+    cmd.output()
+        .with_context(|| format!("failed to execute `{}`", command_line(dir, args)))
+}
+
+/// Apply the locale/prompt-proofing environment shared by every git
+/// invocation this module makes (see [`run`]'s doc comment for the
+/// rationale behind each variable).
+fn shape_env(cmd: &mut Command) {
+    cmd.env("LC_ALL", "C").env("LANGUAGE", "C");
     if std::env::var_os("GIT_TERMINAL_PROMPT").is_none() {
         cmd.env("GIT_TERMINAL_PROMPT", "0");
     }
     if std::env::var_os("GIT_SSH_COMMAND").is_none() {
         cmd.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
     }
-    cmd.output()
-        .with_context(|| format!("failed to execute `{}`", command_line(dir, args)))
+}
+
+/// Clone `url` into `dest` (which must not yet exist -- `git clone` creates
+/// it), with the same locale/prompt-proofing environment as [`run`]. Unlike
+/// `run`, this has no working directory to `-C` into yet, so `dest` is
+/// passed straight through as git's destination argument.
+pub fn clone(url: &str, dest: &Path) -> Result<Output> {
+    let mut cmd = Command::new("git");
+    cmd.arg("clone").arg("--quiet").arg(url).arg(dest);
+    shape_env(&mut cmd);
+    let output = cmd.output().with_context(|| {
+        format!(
+            "failed to execute `git clone --quiet {url} {}`",
+            dest.display()
+        )
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "`git clone --quiet {url} {}` failed ({}): {}",
+            dest.display(),
+            output.status,
+            stderr.trim()
+        );
+    }
+    Ok(output)
 }
 
 /// Like [`run`], but a nonzero exit becomes an `Err` whose message includes
@@ -331,5 +361,64 @@ mod tests {
         let dir = tempdir().unwrap();
         run_ok(dir.path(), &["init", "--quiet"]).unwrap();
         assert!(!merge_in_progress(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn clone_checks_out_the_source_repo_content() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        run_ok(&source, &["init", "--quiet", "-b", "main"]).unwrap();
+        std::fs::write(source.join("Home.md"), "# Home\n").unwrap();
+        run_ok(
+            &source,
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "add",
+                "-A",
+            ],
+        )
+        .unwrap();
+        run_ok(
+            &source,
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ],
+        )
+        .unwrap();
+
+        let dest = root.path().join("dest");
+        clone(source.to_str().unwrap(), &dest).unwrap();
+
+        assert!(dest.join(".git").exists());
+        assert_eq!(
+            std::fs::read_to_string(dest.join("Home.md")).unwrap(),
+            "# Home\n"
+        );
+    }
+
+    #[test]
+    fn clone_of_nonexistent_source_errors_with_stderr() {
+        let root = tempdir().unwrap();
+        let dest = root.path().join("dest");
+        let err = clone("/nonexistent/source.git", &dest).unwrap_err();
+        assert!(
+            err.to_string().contains("git clone"),
+            "error should include the command, got: {err}"
+        );
     }
 }

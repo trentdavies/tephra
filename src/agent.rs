@@ -158,7 +158,7 @@ pub fn status(name: &str, vault: &Vault, json: bool) -> Result<()> {
         vault: name.to_string(),
         work,
         bridge,
-        service: "unknown".to_string(),
+        service: crate::service::detect(name).as_str().to_string(),
     };
 
     if json {

@@ -474,7 +474,11 @@ fn status_json_has_stable_keys_and_correct_dirty_counts() {
         serde_json::from_slice(&output).expect("status --json should emit valid JSON");
 
     assert_eq!(value["vault"], "testvault");
-    assert_eq!(value["service"], "unknown");
+    // No `com.tephra.testvault` service is installed on the test host, so
+    // real platform-tool detection (launchctl/systemctl) reports
+    // "not-loaded" rather than the placeholder "unknown" this field used to
+    // hardcode -- see `src/service.rs`'s `detect`.
+    assert_eq!(value["service"], "not-loaded");
 
     let work = &value["work"];
     assert_eq!(work["exists"], true);

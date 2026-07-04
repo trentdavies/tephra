@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.tephra.goldenvault</string>
+  <key>ProgramArguments</key><array>
+    <string>/fake/bin/tephra</string>
+    <string>bridge</string>
+    <string>--once</string>
+    <string>goldenvault</string>
+  </array>
+  <key>StartInterval</key><integer>120</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>/fake/home/Library/Logs/tephra-goldenvault.log</string>
+  <key>StandardErrorPath</key><string>/fake/home/Library/Logs/tephra-goldenvault.log</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+</dict></plist>

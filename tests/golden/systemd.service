@@ -1,0 +1,6 @@
+[Unit]
+Description=tephra bridge cycle for vault goldenvault
+
+[Service]
+Type=oneshot
+ExecStart=/fake/bin/tephra bridge --once goldenvault

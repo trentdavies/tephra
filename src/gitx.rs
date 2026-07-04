@@ -83,7 +83,7 @@ pub fn clone(url: &str, dest: &Path) -> Result<Output> {
 }
 
 /// Like [`run`], but a nonzero exit becomes an `Err` whose message includes
-/// the full command line and trimmed stderr.
+/// the full command line and the command's output (see [`command_failed`]).
 pub fn run_ok(dir: &Path, args: &[&str]) -> Result<Output> {
     let output = run(dir, args)?;
     if !output.status.success() {
@@ -92,16 +92,31 @@ pub fn run_ok(dir: &Path, args: &[&str]) -> Result<Output> {
     Ok(output)
 }
 
-/// Build the standard "`<cmd>` failed (<status>): <trimmed stderr>" error
-/// for a nonzero git exit.
+/// Build the standard "`<cmd>` failed (<status>): <detail>" error for a
+/// nonzero git exit. `detail` is trimmed stderr, falling back to trimmed
+/// stdout when stderr is empty (some git failures — e.g. `commit` finding
+/// nothing to commit after `.gitattributes` normalization — explain
+/// themselves only on stdout), and including both when both are present.
 fn command_failed(dir: &Path, args: &[&str], output: &Output) -> anyhow::Error {
-    let stderr = String::from_utf8_lossy(&output.stderr);
     anyhow::anyhow!(
         "`{}` failed ({}): {}",
         command_line(dir, args),
         output.status,
-        stderr.trim()
+        failure_detail(output)
     )
+}
+
+fn failure_detail(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = stderr.trim();
+    let stdout = stdout.trim();
+    match (stderr.is_empty(), stdout.is_empty()) {
+        (false, true) => stderr.to_string(),
+        (true, false) => stdout.to_string(),
+        (false, false) => format!("{stderr} (stdout: {stdout})"),
+        (true, true) => "(no output)".to_string(),
+    }
 }
 
 fn command_line(dir: &Path, args: &[&str]) -> String {
@@ -200,6 +215,24 @@ pub fn remotes(dir: &Path) -> Result<Vec<String>> {
 pub fn merge_in_progress(dir: &Path) -> Result<bool> {
     let output = run(dir, &["rev-parse", "-q", "--verify", "MERGE_HEAD"])?;
     Ok(output.status.success())
+}
+
+/// Whether a rebase is in progress: git materializes an in-flight rebase as
+/// a `rebase-merge` or `rebase-apply` directory inside the git dir. The
+/// directories are located via `git rev-parse --git-path` — rather than
+/// path-joining `.git/` ourselves — so this stays correct for worktrees and
+/// any other layout where `.git` isn't a plain directory.
+pub fn rebase_in_progress(dir: &Path) -> Result<bool> {
+    for state_dir in ["rebase-merge", "rebase-apply"] {
+        let output = run_ok(dir, &["rev-parse", "--git-path", state_dir])?;
+        let rel = String::from_utf8_lossy(&output.stdout);
+        // `--git-path` output is relative to the git process's cwd (`dir`,
+        // via `-C`) unless already absolute; `Path::join` handles both.
+        if dir.join(rel.trim()).exists() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -361,6 +394,55 @@ mod tests {
         let dir = tempdir().unwrap();
         run_ok(dir.path(), &["init", "--quiet"]).unwrap();
         assert!(!merge_in_progress(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn rebase_in_progress_is_false_in_fresh_repo() {
+        let dir = tempdir().unwrap();
+        run_ok(dir.path(), &["init", "--quiet"]).unwrap();
+        assert!(!rebase_in_progress(dir.path()).unwrap());
+    }
+
+    // --- failure_detail: which output stream explains the failure ---
+
+    #[cfg(unix)]
+    fn synthetic_output(stdout: &str, stderr: &str) -> Output {
+        use std::os::unix::process::ExitStatusExt;
+        Output {
+            status: std::process::ExitStatus::from_raw(256), // exit code 1
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failure_detail_prefers_stderr() {
+        let output = synthetic_output("some stdout\n", "fatal: the real reason\n");
+        assert_eq!(
+            failure_detail(&output),
+            "fatal: the real reason (stdout: some stdout)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failure_detail_falls_back_to_stdout_when_stderr_empty() {
+        // Reproduces the stdout-only git failure shape (e.g. `git commit`
+        // reporting "nothing to commit" on stdout after .gitattributes
+        // normalization) that previously produced an empty error detail.
+        let output = synthetic_output("nothing to commit, working tree clean\n", "");
+        assert_eq!(
+            failure_detail(&output),
+            "nothing to commit, working tree clean"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failure_detail_notes_when_both_streams_are_empty() {
+        let output = synthetic_output("", "");
+        assert_eq!(failure_detail(&output), "(no output)");
     }
 
     #[test]

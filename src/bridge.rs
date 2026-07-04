@@ -19,11 +19,19 @@ use crate::notify;
 
 /// Lock dir name, under `<bridge>/.git/`. `mkdir` is atomic on every
 /// platform tephra targets (unlike `flock`, which isn't stock on macOS).
-const LOCK_DIR_NAME: &str = "tephra-bridge.lock";
+/// `pub(crate)` because `agent::status` reports on the same file.
+pub(crate) const LOCK_DIR_NAME: &str = "tephra-bridge.lock";
 /// A lock dir older than this is assumed abandoned by a crashed run.
 const LOCK_STALE_AFTER: Duration = Duration::from_secs(30 * 60);
-/// Failure-counter file name, under `<bridge>/.git/`.
-const FAILCOUNT_FILE_NAME: &str = "tephra-bridge.failcount";
+/// Failure-counter file name, under `<bridge>/.git/`. Deleted after every
+/// successful fetch and never written as 0, so "absent" means no
+/// consecutive failures. `pub(crate)`: see [`LOCK_DIR_NAME`].
+pub(crate) const FAILCOUNT_FILE_NAME: &str = "tephra-bridge.failcount";
+/// Heartbeat file name, under `<bridge>/.git/`: a single line
+/// `<RFC3339 UTC timestamp> <outcome>`, rewritten at the end of every
+/// completed cycle (see [`write_heartbeat`]). `pub(crate)`: see
+/// [`LOCK_DIR_NAME`].
+pub(crate) const LASTCYCLE_FILE_NAME: &str = "tephra-bridge.lastcycle";
 /// Consecutive remote failures before notifying the desktop (~30 min at the
 /// service's 2-minute cycle interval).
 const NOTIFY_AFTER: u32 = 15;
@@ -85,6 +93,7 @@ pub fn run_once(name: &str, vault: &Vault) -> Result<()> {
     if !merge.status.success() && !resolve_conflicts_and_commit(bridge, name)? {
         // Resolution commit failed: merge already aborted and logged;
         // tree is clean, skip the push, next cycle retries.
+        write_heartbeat(bridge, "conflict-abort");
         return Ok(());
     }
 
@@ -111,8 +120,23 @@ pub fn run_once(name: &str, vault: &Vault) -> Result<()> {
         }
     }
 
+    write_heartbeat(bridge, "ok");
     log(name, "cycle complete");
     Ok(())
+}
+
+/// Record when the cycle last completed and how, so `tephra status` (and
+/// the e2e layer sensing through it) can distinguish "healthy but idle"
+/// from "never ran" and "running but failing". Written on every completion
+/// path of [`run_once`] — success (`ok`), remote-failure exit
+/// (`remote-failure`), and the conflict-abort skip (`conflict-abort`) —
+/// but not on hard (nonzero-exit) errors or lock-contended skips, which
+/// aren't completed cycles. Best-effort: a heartbeat write failure must
+/// never fail the cycle that just did real work.
+fn write_heartbeat(bridge: &Path, outcome: &str) {
+    let path = bridge.join(".git").join(LASTCYCLE_FILE_NAME);
+    let stamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let _ = fs::write(&path, format!("{stamp} {outcome}\n"));
 }
 
 /// The bridge dir must exist and be a git working tree; anything else is a
@@ -304,6 +328,7 @@ fn remote_failed(bridge: &Path, name: &str, remote: &str) -> Result<()> {
             &format!("{remote} unreachable; vault commits queuing locally"),
         );
     }
+    write_heartbeat(bridge, "remote-failure");
     Ok(())
 }
 

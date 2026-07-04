@@ -88,6 +88,69 @@ fn lock_path(fx: &Fixture) -> PathBuf {
     fx.bridge.join(".git").join("tephra-bridge.lock")
 }
 
+fn lastcycle_path(fx: &Fixture) -> PathBuf {
+    fx.bridge.join(".git").join("tephra-bridge.lastcycle")
+}
+
+fn status_json(fx: &Fixture) -> serde_json::Value {
+    let output = fx
+        .tephra_cmd()
+        .arg("status")
+        .arg("--json")
+        .arg(&fx.name)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    serde_json::from_slice(&output).expect("status --json should emit valid JSON")
+}
+
+// --- heartbeat: every completed cycle records when it ran and how -------
+
+#[test]
+fn successful_cycle_writes_ok_heartbeat_visible_in_status() {
+    let fx = Fixture::new("testvault");
+
+    fx.bridge_once().assert().success();
+
+    let content = fs::read_to_string(lastcycle_path(&fx))
+        .expect("a completed cycle should write the heartbeat file");
+    let (stamp, outcome) = content
+        .trim()
+        .split_once(' ')
+        .expect("heartbeat should be '<timestamp> <outcome>'");
+    chrono::DateTime::parse_from_rfc3339(stamp)
+        .unwrap_or_else(|e| panic!("heartbeat timestamp should be RFC3339, got {stamp:?}: {e}"));
+    assert_eq!(outcome, "ok");
+
+    let value = status_json(&fx);
+    assert_eq!(value["bridge"]["last_cycle_outcome"], "ok");
+    assert!(
+        value["bridge"]["last_cycle_at"].is_string(),
+        "status should surface the heartbeat timestamp"
+    );
+}
+
+#[test]
+fn offline_cycle_writes_remote_failure_heartbeat_visible_in_status() {
+    let fx = Fixture::new("testvault");
+    let gone = fx.root.path().join("remote.gone");
+    fs::rename(&fx.remote, &gone).expect("rename remote.git away to simulate an outage");
+
+    fx.bridge_once().assert().success();
+
+    let content = fs::read_to_string(lastcycle_path(&fx))
+        .expect("a remote-failure cycle should still write the heartbeat file");
+    assert!(
+        content.trim().ends_with(" remote-failure"),
+        "heartbeat outcome should be remote-failure, got: {content:?}"
+    );
+
+    let value = status_json(&fx);
+    assert_eq!(value["bridge"]["last_cycle_outcome"], "remote-failure");
+}
+
 // --- harness test 1: human edit propagated to the agent clone -----------
 
 #[test]

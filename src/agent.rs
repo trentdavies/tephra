@@ -16,6 +16,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::Serialize;
 
+use crate::bridge::{FAILCOUNT_FILE_NAME, LASTCYCLE_FILE_NAME, LOCK_DIR_NAME};
 use crate::config::Vault;
 use crate::gitx;
 
@@ -87,20 +88,33 @@ fn commit_all_if_dirty(dir: &Path, msg: &str) -> Result<bool> {
     Ok(true)
 }
 
-/// `git pull --rebase --autostash`; on failure, always abort the rebase
-/// (tolerating the abort's own failure) and report a plain domain error --
-/// this is the load-bearing "never leave a rebase in progress" rule from
-/// `docs/DESIGN.md`.
+/// `git pull --rebase --autostash`, with faithful failure diagnosis. If the
+/// failure left a rebase in progress (a genuine conflict), abort it
+/// (tolerating the abort's own failure) and report the wedge-rule message
+/// -- this is the load-bearing "never leave a rebase in progress" rule from
+/// `docs/DESIGN.md`. Any other pull failure (detached HEAD, unreachable or
+/// deleted remote, ...) is NOT a rebase conflict: there is nothing to
+/// abort, and "resolve manually" would be wrong advice, so git's own
+/// diagnosis is surfaced instead. Both are plain domain errors (exit 1).
 fn pull_rebase(dir: &Path) -> Result<()> {
     let pull = gitx::run(dir, &["pull", "-q", "--rebase", "--autostash"])?;
-    if !pull.status.success() {
+    if pull.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&pull.stderr);
+    let stderr = stderr.trim();
+    if gitx::rebase_in_progress(dir)? {
         let _ = gitx::run(dir, &["rebase", "--abort"]);
         anyhow::bail!(
-            "rebase conflict in {} — resolve manually (local commit kept)",
+            "rebase conflict in {} — resolve manually (local commit kept): {stderr}",
             dir.display()
         );
     }
-    Ok(())
+    anyhow::bail!(
+        "`git pull --rebase --autostash` failed in {}: {stderr}",
+        dir.display()
+    );
 }
 
 /// `tephra status`: best-effort snapshot of the work clone and the bridge
@@ -174,9 +188,20 @@ impl GitSnapshot {
 struct BridgeSnapshot {
     #[serde(flatten)]
     git: GitSnapshot,
+    /// Consecutive remote-failure count from the bridge's counter file.
+    /// `null` means the file is absent, i.e. either no consecutive failures
+    /// (the bridge deletes the file on success and never writes 0) or no
+    /// bridge checkout at all.
     failcount: Option<u32>,
     lock: bool,
     last_commit: Option<String>,
+    /// RFC3339 UTC timestamp of the bridge's last completed cycle. `null`
+    /// (together with `last_cycle_outcome`) means the heartbeat file is
+    /// absent: the bridge has never completed a cycle.
+    last_cycle_at: Option<String>,
+    /// Outcome of the last completed cycle:
+    /// `ok` | `remote-failure` | `conflict-abort`.
+    last_cycle_outcome: Option<String>,
 }
 
 impl BridgeSnapshot {
@@ -187,11 +212,14 @@ impl BridgeSnapshot {
         } else {
             None
         };
+        let (last_cycle_at, last_cycle_outcome) = last_cycle(dir);
         BridgeSnapshot {
             git,
             failcount: failcount(dir),
             lock: lock_present(dir),
             last_commit,
+            last_cycle_at,
+            last_cycle_outcome,
         }
     }
 }
@@ -239,14 +267,28 @@ fn last_commit_subject(dir: &Path) -> Option<String> {
 }
 
 fn failcount(bridge: &Path) -> Option<u32> {
-    let path = bridge.join(".git").join("tephra-bridge.failcount");
+    let path = bridge.join(".git").join(FAILCOUNT_FILE_NAME);
     std::fs::read_to_string(path)
         .ok()
         .and_then(|s| s.trim().parse().ok())
 }
 
 fn lock_present(bridge: &Path) -> bool {
-    bridge.join(".git").join("tephra-bridge.lock").is_dir()
+    bridge.join(".git").join(LOCK_DIR_NAME).is_dir()
+}
+
+/// Parse the bridge's heartbeat file (`<RFC3339 UTC> <outcome>`) into its
+/// `(at, outcome)` halves. `(None, None)` when the file is absent (the
+/// bridge has never completed a cycle) or unreadable.
+fn last_cycle(bridge: &Path) -> (Option<String>, Option<String>) {
+    let path = bridge.join(".git").join(LASTCYCLE_FILE_NAME);
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return (None, None);
+    };
+    match text.trim().split_once(' ') {
+        Some((at, outcome)) => (non_empty(at), non_empty(outcome)),
+        None => (non_empty(text.trim()), None),
+    }
 }
 
 fn non_empty(s: &str) -> Option<String> {
@@ -264,11 +306,23 @@ fn print_human(report: &StatusReport) {
     println!();
     print_git_section("bridge", &report.bridge.git);
     println!("  failcount:    {}", opt_display(&report.bridge.failcount));
-    println!(
-        "  lock:         {}",
-        if report.bridge.lock { "held" } else { "free" }
-    );
+    let lock = match (report.bridge.git.exists, report.bridge.lock) {
+        // No bridge checkout: lock state is unknowable, not "free".
+        (false, _) => "-",
+        (true, true) => "held",
+        (true, false) => "free",
+    };
+    println!("  lock:         {lock}");
     println!("  last commit:  {}", opt_str(&report.bridge.last_commit));
+    let last_cycle = match (
+        &report.bridge.last_cycle_at,
+        &report.bridge.last_cycle_outcome,
+    ) {
+        (Some(at), Some(outcome)) => format!("{at} ({outcome})"),
+        (Some(at), None) => at.clone(),
+        _ => "-".to_string(),
+    };
+    println!("  last cycle:   {last_cycle}");
     println!();
     println!("service: {}", report.service);
 }
@@ -341,6 +395,31 @@ mod tests {
         std::fs::create_dir(dir.path().join(".git")).unwrap();
         std::fs::write(dir.path().join(".git").join("tephra-bridge.failcount"), "5").unwrap();
         assert_eq!(failcount(dir.path()), Some(5));
+    }
+
+    #[test]
+    fn last_cycle_absent_file_is_none_none() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        assert_eq!(last_cycle(dir.path()), (None, None));
+    }
+
+    #[test]
+    fn last_cycle_parses_timestamp_and_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(
+            dir.path().join(".git").join(LASTCYCLE_FILE_NAME),
+            "2026-07-03T12:00:00Z ok\n",
+        )
+        .unwrap();
+        assert_eq!(
+            last_cycle(dir.path()),
+            (
+                Some("2026-07-03T12:00:00Z".to_string()),
+                Some("ok".to_string())
+            )
+        );
     }
 
     #[test]

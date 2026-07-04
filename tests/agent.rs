@@ -9,6 +9,7 @@ use std::fs;
 use std::path::Path;
 
 use common::Fixture;
+use predicates::prelude::PredicateBooleanExt;
 
 fn git_ok(fx: &Fixture, dir: &Path, args: &[&str]) {
     let output = fx.git(dir, args);
@@ -216,6 +217,42 @@ fn wedge_drill_rebase_conflict_leaves_a_clean_recoverable_clone() {
     );
 }
 
+// --- 5b. pull failures that are NOT rebase conflicts must be reported as
+// what they actually are: "resolve manually (local commit kept)" is
+// actively wrong advice for a detached HEAD or a missing remote, so those
+// must surface git's own diagnosis instead of the conflict wording.
+
+#[test]
+fn sync_on_detached_head_reports_gits_reason_not_rebase_conflict() {
+    let fx = Fixture::new("testvault");
+    git_ok(&fx, &fx.agent, &["checkout", "-q", "--detach"]);
+
+    fx.tephra_cmd()
+        .arg("sync")
+        .arg(&fx.name)
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicates::str::contains("not currently on a branch"))
+        .stderr(predicates::str::contains("rebase conflict").not());
+}
+
+#[test]
+fn sync_with_missing_remote_reports_the_real_reason_not_rebase_conflict() {
+    let fx = Fixture::new("testvault");
+    let gone = fx.root.path().join("remote.gone");
+    fs::rename(&fx.remote, &gone).unwrap();
+
+    fx.tephra_cmd()
+        .arg("sync")
+        .arg(&fx.name)
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicates::str::contains("repository"))
+        .stderr(predicates::str::contains("rebase conflict").not());
+}
+
 // --- 6. push race: remote advances between the local commit and the push -
 
 #[test]
@@ -310,16 +347,118 @@ fn status_json_has_stable_keys_and_correct_dirty_counts() {
     let work = &value["work"];
     assert_eq!(work["exists"], true);
     assert_eq!(work["dirty"], 1);
-    assert!(work.get("branch").is_some());
-    assert!(work.get("ahead").is_some());
-    assert!(work.get("behind").is_some());
+    assert_eq!(work["branch"], "main");
+    assert_eq!(work["ahead"], 0);
+    assert_eq!(work["behind"], 0);
 
     let bridge = &value["bridge"];
     assert_eq!(bridge["exists"], true);
     assert_eq!(bridge["dirty"], 0);
+    assert_eq!(bridge["branch"], "main");
     assert_eq!(bridge["failcount"], 3);
     assert_eq!(bridge["lock"], false);
-    assert!(bridge.get("last_commit").is_some());
+    assert_eq!(bridge["last_commit"], "init");
+    // Never cycled: the heartbeat file doesn't exist yet.
+    assert_eq!(bridge["last_cycle_at"], serde_json::Value::Null);
+    assert_eq!(bridge["last_cycle_outcome"], serde_json::Value::Null);
+}
+
+#[test]
+fn status_json_reports_real_ahead_behind_counts() {
+    let fx = Fixture::new("testvault");
+
+    // Remote advances by one commit via a second clone...
+    let racer = fx.root.path().join("racer");
+    git_ok(
+        &fx,
+        fx.root.path(),
+        &[
+            "clone",
+            "--quiet",
+            fx.remote.to_str().unwrap(),
+            racer.to_str().unwrap(),
+        ],
+    );
+    fs::write(racer.join("Remote.md"), "remote note\n").unwrap();
+    git_ok(&fx, &racer, &["add", "-A"]);
+    git_ok(&fx, &racer, &["commit", "--quiet", "-m", "remote: advance"]);
+    git_ok(&fx, &racer, &["push", "--quiet", "origin", "main"]);
+
+    // ...the agent commits one locally without pushing, and fetches (status
+    // itself makes no network calls, so the remote-tracking ref must be
+    // refreshed out-of-band for `behind` to see the advance).
+    fs::write(fx.agent.join("Local.md"), "local note\n").unwrap();
+    git_ok(&fx, &fx.agent, &["add", "-A"]);
+    git_ok(
+        &fx,
+        &fx.agent,
+        &["commit", "--quiet", "-m", "memory: local"],
+    );
+    git_ok(&fx, &fx.agent, &["fetch", "--quiet", "origin"]);
+
+    let output = fx
+        .tephra_cmd()
+        .arg("status")
+        .arg("--json")
+        .arg(&fx.name)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(value["work"]["ahead"], 1);
+    assert_eq!(value["work"]["behind"], 1);
+}
+
+#[test]
+fn status_json_ahead_behind_null_without_upstream() {
+    let fx = Fixture::new("testvault");
+    git_ok(&fx, &fx.agent, &["checkout", "-q", "-b", "feature"]);
+
+    let output = fx
+        .tephra_cmd()
+        .arg("status")
+        .arg("--json")
+        .arg(&fx.name)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(value["work"]["branch"], "feature");
+    assert_eq!(value["work"]["ahead"], serde_json::Value::Null);
+    assert_eq!(value["work"]["behind"], serde_json::Value::Null);
+}
+
+#[test]
+fn status_human_mode_prints_dash_for_lock_when_bridge_absent() {
+    let fx = Fixture::new("testvault");
+    fs::remove_dir_all(&fx.bridge).unwrap();
+
+    let output = fx
+        .tephra_cmd()
+        .arg("status")
+        .arg(&fx.name)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8_lossy(&output);
+    let lock_line = stdout
+        .lines()
+        .find(|l| l.trim_start().starts_with("lock:"))
+        .expect("human status should print a lock line");
+    assert_eq!(
+        lock_line.split_whitespace().nth(1),
+        Some("-"),
+        "lock should be '-' (unknowable) when the bridge is absent, got: {lock_line:?}"
+    );
 }
 
 #[test]

@@ -1,0 +1,12 @@
+[Unit]
+Description=tephra obsidian sync for vault goldenvault
+
+[Service]
+Type=simple
+ExecStart="/fake/bin/ob" sync --continuous
+WorkingDirectory="/fake/home/bridge-goldenvault"
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target

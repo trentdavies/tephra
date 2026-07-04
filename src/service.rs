@@ -61,7 +61,10 @@ pub fn log_filename(vault: &str) -> String {
 /// XML string/attribute value. Vault names and exe paths tephra generates
 /// itself are never adversarial, but a stray `&` in a path (rare, but legal
 /// on both platforms) would otherwise produce invalid XML.
-fn xml_escape(s: &str) -> String {
+///
+/// `pub(crate)`: shared with `obsidian.rs`'s own launchd plist generator
+/// (Task 9) rather than duplicated there.
+pub(crate) fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -69,14 +72,25 @@ fn xml_escape(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+/// Render a plist `<array>`'s `<string>` elements, one per line, 4-space
+/// indented to match this module's plist bodies -- each item XML-escaped.
+/// `pub(crate)`: shared with `obsidian.rs`'s launchd plist generator so the
+/// `ProgramArguments` array-rendering logic isn't duplicated there.
+pub(crate) fn plist_string_array(items: &[&str]) -> String {
+    items
+        .iter()
+        .map(|s| format!("    <string>{}</string>\n", xml_escape(s)))
+        .collect()
+}
+
 /// Generate the launchd plist for `vault`: runs `<exe> bridge --once
 /// <vault>` every 120s (`StartInterval`) plus once immediately on load
 /// (`RunAtLoad`), logging both streams to `log_path`.
 pub fn generate_launchd_plist(exe: &Path, vault: &str, log_path: &Path) -> String {
     let label = xml_escape(&launchd_label(vault));
-    let exe = xml_escape(&exe.display().to_string());
-    let vault = xml_escape(vault);
+    let exe_str = exe.display().to_string();
     let log = xml_escape(&log_path.display().to_string());
+    let program = plist_string_array(&[&exe_str, "bridge", "--once", vault]);
 
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -84,11 +98,7 @@ pub fn generate_launchd_plist(exe: &Path, vault: &str, log_path: &Path) -> Strin
 <plist version="1.0"><dict>
   <key>Label</key><string>{label}</string>
   <key>ProgramArguments</key><array>
-    <string>{exe}</string>
-    <string>bridge</string>
-    <string>--once</string>
-    <string>{vault}</string>
-  </array>
+{program}  </array>
   <key>StartInterval</key><integer>120</integer>
   <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>{log}</string>
@@ -220,12 +230,105 @@ impl ServiceState {
 /// non-mac/non-linux `imp` module) so it's exercised by a unit test on
 /// every platform, not just the ones where it's actually reachable at
 /// runtime.
+/// `pub(crate)`: `obsidian.rs`'s own unsupported-platform `imp` module
+/// (Task 9) reuses this rather than duplicating the message.
 #[allow(dead_code)] // reachable via imp::install/uninstall only on other target_os; see the module doc comment.
-fn unsupported_platform_error() -> anyhow::Error {
+pub(crate) fn unsupported_platform_error() -> anyhow::Error {
     anyhow::anyhow!(
         "tephra service management is only supported on macOS and Linux (detected: {})",
         std::env::consts::OS
     )
+}
+
+// --- shared platform-tool plumbing (macOS launchctl / Linux systemctl) ---
+//
+// Extracted to top-level, `pub(crate)` functions so `obsidian.rs`'s own
+// launchd/systemd install-uninstall (Task 9, the `ob sync --continuous`
+// KeepAlive/Restart=always service) can reuse the exact same
+// bootout->bootstrap and systemctl-with-error-context plumbing instead of
+// duplicating it. Behavior/signatures are unchanged from what previously
+// lived as private helpers inside each platform's `imp` module below.
+
+#[cfg(target_os = "macos")]
+const BOOTSTRAP_ATTEMPTS: u32 = 3;
+#[cfg(target_os = "macos")]
+const BOOTSTRAP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
+#[cfg(target_os = "macos")]
+pub(crate) fn launchctl_current_uid() -> Result<String> {
+    use anyhow::Context;
+    let output = std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .context("failed to run `id -u`")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "`id -u` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// `launchctl bootout gui/<uid>/<label>`, tolerating failure (the service
+/// simply wasn't loaded yet -- true on first install, and on every
+/// subsequent one after the matching `bootout` already succeeded).
+#[cfg(target_os = "macos")]
+pub(crate) fn launchctl_bootout_ignore_failure(label: &str) -> Result<()> {
+    let uid = launchctl_current_uid()?;
+    let target = format!("gui/{uid}/{label}");
+    let _ = std::process::Command::new("launchctl")
+        .arg("bootout")
+        .arg(target)
+        .output();
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn launchctl_bootstrap_with_retry(plist_path: &Path) -> Result<()> {
+    use anyhow::Context;
+    let uid = launchctl_current_uid()?;
+    let domain = format!("gui/{uid}");
+    let mut last_stderr = String::new();
+    for attempt in 1..=BOOTSTRAP_ATTEMPTS {
+        let output = std::process::Command::new("launchctl")
+            .arg("bootstrap")
+            .arg(&domain)
+            .arg(plist_path)
+            .output()
+            .context("failed to run `launchctl bootstrap`")?;
+        if output.status.success() {
+            return Ok(());
+        }
+        last_stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if attempt < BOOTSTRAP_ATTEMPTS {
+            std::thread::sleep(BOOTSTRAP_RETRY_DELAY);
+        }
+    }
+    anyhow::bail!(
+        "`launchctl bootstrap {domain} {}` failed after {BOOTSTRAP_ATTEMPTS} attempts: {last_stderr}",
+        plist_path.display()
+    );
+}
+
+/// `systemctl --user <args>`, with error context naming the failing
+/// subcommand and its stderr.
+#[cfg(target_os = "linux")]
+pub(crate) fn systemctl_user(args: &[&str]) -> Result<()> {
+    use anyhow::Context;
+    let output = std::process::Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .output()
+        .context("failed to run `systemctl --user`")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "`systemctl --user {}` failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 /// Write and load the platform service for `vault`, pointing at the
@@ -261,19 +364,11 @@ pub fn status(name: &str) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 mod imp {
-    use std::path::Path;
     use std::process::Command;
-    use std::time::Duration;
 
     use anyhow::{Context, Result};
 
     use super::ServiceState;
-
-    /// `launchctl bootstrap` attempts before giving up: a `bootout` of a
-    /// still-live service is asynchronous, so an immediate `bootstrap` can
-    /// race it (DESIGN.md §Service management).
-    const BOOTSTRAP_ATTEMPTS: u32 = 3;
-    const BOOTSTRAP_RETRY_DELAY: Duration = Duration::from_secs(1);
 
     pub fn install(vault: &str) -> Result<()> {
         let exe = std::env::current_exe().context("resolving the tephra executable path")?;
@@ -294,8 +389,8 @@ mod imp {
             .with_context(|| format!("writing {}", plist_path.display()))?;
 
         let label = super::launchd_label(vault);
-        bootout_ignore_failure(&label)?;
-        bootstrap_with_retry(&plist_path)?;
+        super::launchctl_bootout_ignore_failure(&label)?;
+        super::launchctl_bootstrap_with_retry(&plist_path)?;
 
         println!(
             "installed and loaded service for vault '{vault}':\n  unit: {}\n  log:  {}\n\
@@ -314,7 +409,7 @@ mod imp {
             return Ok(());
         }
 
-        bootout_ignore_failure(&super::launchd_label(vault))?;
+        super::launchctl_bootout_ignore_failure(&super::launchd_label(vault))?;
         std::fs::remove_file(&plist_path)
             .with_context(|| format!("removing {}", plist_path.display()))?;
 
@@ -333,7 +428,7 @@ mod imp {
 
     pub fn detect(vault: &str) -> ServiceState {
         let label = super::launchd_label(vault);
-        let uid = match current_uid() {
+        let uid = match super::launchctl_current_uid() {
             Ok(uid) => uid,
             Err(_) => return ServiceState::Unknown,
         };
@@ -343,59 +438,6 @@ mod imp {
             Ok(_) => ServiceState::NotLoaded,
             Err(_) => ServiceState::Unknown,
         }
-    }
-
-    fn current_uid() -> Result<String> {
-        let output = Command::new("id")
-            .arg("-u")
-            .output()
-            .context("failed to run `id -u`")?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "`id -u` failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    }
-
-    /// `launchctl bootout gui/<uid>/<label>`, tolerating failure (the
-    /// service simply wasn't loaded yet -- true on first install, and on
-    /// every subsequent one after the matching `bootout` two lines up
-    /// already succeeded).
-    fn bootout_ignore_failure(label: &str) -> Result<()> {
-        let uid = current_uid()?;
-        let target = format!("gui/{uid}/{label}");
-        let _ = Command::new("launchctl")
-            .arg("bootout")
-            .arg(target)
-            .output();
-        Ok(())
-    }
-
-    fn bootstrap_with_retry(plist_path: &Path) -> Result<()> {
-        let uid = current_uid()?;
-        let domain = format!("gui/{uid}");
-        let mut last_stderr = String::new();
-        for attempt in 1..=BOOTSTRAP_ATTEMPTS {
-            let output = Command::new("launchctl")
-                .arg("bootstrap")
-                .arg(&domain)
-                .arg(plist_path)
-                .output()
-                .context("failed to run `launchctl bootstrap`")?;
-            if output.status.success() {
-                return Ok(());
-            }
-            last_stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            if attempt < BOOTSTRAP_ATTEMPTS {
-                std::thread::sleep(BOOTSTRAP_RETRY_DELAY);
-            }
-        }
-        anyhow::bail!(
-            "`launchctl bootstrap {domain} {}` failed after {BOOTSTRAP_ATTEMPTS} attempts: {last_stderr}",
-            plist_path.display()
-        );
     }
 }
 
@@ -421,8 +463,8 @@ mod imp {
         std::fs::write(&timer_path, super::generate_systemd_timer(vault))
             .with_context(|| format!("writing {}", timer_path.display()))?;
 
-        systemctl(&["daemon-reload"])?;
-        systemctl(&["enable", "--now", &super::systemd_timer_name(vault)])?;
+        super::systemctl_user(&["daemon-reload"])?;
+        super::systemctl_user(&["enable", "--now", &super::systemd_timer_name(vault)])?;
 
         // Wording: `enable --now` starts the TIMER unit, not the service
         // itself. Whether the service then fires immediately depends on the
@@ -461,7 +503,7 @@ mod imp {
                     .with_context(|| format!("removing {}", path.display()))?;
             }
         }
-        let _ = systemctl(&["daemon-reload"]);
+        let _ = super::systemctl_user(&["daemon-reload"]);
 
         println!(
             "uninstalled service for vault '{vault}': removed {} and {}",
@@ -499,22 +541,6 @@ mod imp {
         } else {
             ServiceState::NotLoaded
         }
-    }
-
-    fn systemctl(args: &[&str]) -> Result<()> {
-        let output = Command::new("systemctl")
-            .arg("--user")
-            .args(args)
-            .output()
-            .context("failed to run `systemctl --user`")?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "`systemctl --user {}` failed: {}",
-                args.join(" "),
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        Ok(())
     }
 }
 

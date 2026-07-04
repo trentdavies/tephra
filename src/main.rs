@@ -1,6 +1,8 @@
+use std::path::PathBuf;
+
 use clap::{Args, Parser, Subcommand};
 
-use tephra::{agent, bridge, config, service};
+use tephra::{agent, bridge, config, obsidian, service};
 
 /// tephra: layered memory for humans and their agents.
 #[derive(Parser)]
@@ -163,8 +165,21 @@ enum ObsidianAction {
 
 #[derive(Subcommand)]
 enum ObsidianServiceAction {
-    /// KeepAlive service for `ob sync --continuous`
+    /// KeepAlive/Restart=always service for `ob sync --continuous`
     Install {
+        /// Vault name (defaults to the sole configured vault)
+        vault: Option<String>,
+
+        /// Pin the node interpreter (writes `<node> <resolved cli.js>`
+        /// instead of bare `ob`); use when the service's node differs from
+        /// the shebang `ob` would otherwise resolve under launchd/systemd's
+        /// minimal environment
+        #[arg(long)]
+        node: Option<PathBuf>,
+    },
+
+    /// Unload + remove the obsidian sync platform service
+    Uninstall {
         /// Vault name (defaults to the sole configured vault)
         vault: Option<String>,
     },
@@ -211,7 +226,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Commands::Obsidian { action } => match action {
             ObsidianAction::Doctor { vault } => cmd_obsidian_doctor(vault),
             ObsidianAction::Service { action } => match action {
-                ObsidianServiceAction::Install { vault } => cmd_obsidian_service_install(vault),
+                ObsidianServiceAction::Install { vault, node } => {
+                    cmd_obsidian_service_install(vault, node)
+                }
+                ObsidianServiceAction::Uninstall { vault } => cmd_obsidian_service_uninstall(vault),
             },
         },
         Commands::Doctor { vault } => cmd_doctor(vault),
@@ -281,12 +299,25 @@ fn cmd_agent_init(vault: Option<String>, force: bool) -> anyhow::Result<()> {
     agent::init(resolved.name, resolved.vault, force)
 }
 
-fn cmd_obsidian_doctor(_vault: Option<String>) -> anyhow::Result<()> {
-    anyhow::bail!("not implemented")
+fn cmd_obsidian_doctor(vault: Option<String>) -> anyhow::Result<()> {
+    let cfg = config::load()?;
+    let resolved = config::resolve_vault(&cfg, vault.as_deref())?;
+    obsidian::doctor(resolved.name, resolved.vault)
 }
 
-fn cmd_obsidian_service_install(_vault: Option<String>) -> anyhow::Result<()> {
-    anyhow::bail!("not implemented")
+fn cmd_obsidian_service_install(
+    vault: Option<String>,
+    node: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let cfg = config::load()?;
+    let resolved = config::resolve_vault(&cfg, vault.as_deref())?;
+    obsidian::service_install(resolved.name, resolved.vault, node.as_deref())
+}
+
+fn cmd_obsidian_service_uninstall(vault: Option<String>) -> anyhow::Result<()> {
+    let cfg = config::load()?;
+    let resolved = config::resolve_vault(&cfg, vault.as_deref())?;
+    obsidian::service_uninstall(resolved.name)
 }
 
 fn cmd_doctor(_vault: Option<String>) -> anyhow::Result<()> {

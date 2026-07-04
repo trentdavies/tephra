@@ -8,4 +8,5 @@ pub mod bridge;
 pub mod config;
 pub mod gitx;
 pub mod notify;
+pub mod obsidian;
 pub mod service;

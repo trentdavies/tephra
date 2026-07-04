@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.tephra.obsidian-sync.goldenvault</string>
+  <key>ProgramArguments</key><array>
+    <string>/fake/node/bin/node</string>
+    <string>/fake/lib/node_modules/obsidian-headless/cli.js</string>
+    <string>sync</string>
+    <string>--continuous</string>
+  </array>
+  <key>WorkingDirectory</key><string>/fake/home/bridge-goldenvault</string>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>StandardOutPath</key><string>/fake/home/Library/Logs/tephra-obsidian-goldenvault.log</string>
+  <key>StandardErrorPath</key><string>/fake/home/Library/Logs/tephra-obsidian-goldenvault.log</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+</dict></plist>

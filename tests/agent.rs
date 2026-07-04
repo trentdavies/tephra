@@ -45,6 +45,22 @@ fn commit_count_all(fx: &Fixture, dir: &Path) -> u32 {
         .expect("rev-list --count should print an integer")
 }
 
+/// Commit count reachable from HEAD only (unlike [`commit_count_all`],
+/// excludes stash refs -- an autostash-pop conflict legitimately leaves a
+/// stash entry behind, which must not skew "no new commits" assertions).
+fn commit_count_head(fx: &Fixture, dir: &Path) -> u32 {
+    let output = fx.git(dir, &["rev-list", "--count", "HEAD"]);
+    assert!(
+        output.status.success(),
+        "rev-list --count HEAD failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .expect("rev-list --count should print an integer")
+}
+
 fn is_clean(fx: &Fixture, dir: &Path) -> bool {
     let output = fx.git(dir, &["status", "--porcelain"]);
     assert!(output.status.success());
@@ -251,6 +267,122 @@ fn sync_with_missing_remote_reports_the_real_reason_not_rebase_conflict() {
         .code(1)
         .stderr(predicates::str::contains("repository"))
         .stderr(predicates::str::contains("rebase conflict").not());
+}
+
+// --- 5c. autostash-pop conflict: git can exit 0 while the autostash pop
+// conflicts, leaving UU unmerged paths with NO rebase in progress. Left
+// unguarded, the next sync's add -A + commit would bake the conflict
+// markers into the vault as an agent commit. `sync` must refuse at both
+// points: right after its own pull (autostash guard), and before any
+// commit when the state arose some other way (pre-commit guard).
+
+#[test]
+fn autostash_pop_conflict_is_refused_never_committed() {
+    let fx = Fixture::new("testvault");
+
+    // Remote advances, changing Home.md's content.
+    let racer = fx.root.path().join("racer");
+    git_ok(
+        &fx,
+        fx.root.path(),
+        &[
+            "clone",
+            "--quiet",
+            fx.remote.to_str().unwrap(),
+            racer.to_str().unwrap(),
+        ],
+    );
+    fs::write(racer.join("Home.md"), "REMOTE VERSION\n").unwrap();
+    git_ok(&fx, &racer, &["add", "-A"]);
+    git_ok(
+        &fx,
+        &racer,
+        &["commit", "--quiet", "-m", "remote: edit home"],
+    );
+    git_ok(&fx, &racer, &["push", "--quiet", "origin", "main"]);
+
+    // A post-commit hook dirties Home.md with a conflicting uncommitted
+    // change right after sync's commit-all, so sync's own
+    // `pull --rebase --autostash` hits the autostash-pop conflict
+    // deterministically (probe-verified: the pull exits 0 with UU paths
+    // and no rebase in progress).
+    let hook_path = fx.agent.join(".git/hooks/post-commit");
+    let marker = fx.agent.join(".git/tephra-test-dirty-fired");
+    let hook = format!(
+        "#!/bin/sh\n\
+         if [ ! -f '{marker}' ]; then\n\
+         \x20\x20touch '{marker}'\n\
+         \x20\x20printf 'LOCAL DIRTY VERSION\\n' > '{home}'\n\
+         fi\n\
+         exit 0\n",
+        marker = marker.display(),
+        home = fx.agent.join("Home.md").display(),
+    );
+    fs::write(&hook_path, hook).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&hook_path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // Something legitimate to commit, so sync's commit-all (and thus the
+    // hook) fires before the pull.
+    fs::write(fx.agent.join("Notes.md"), "agent note\n").unwrap();
+
+    // First sync: its own pull leaves the UU state; the post-pull guard
+    // must refuse -- exit 1, nothing pushed.
+    fx.tephra_cmd()
+        .arg("sync")
+        .arg(&fx.name)
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicates::str::contains("autostash restore conflicted"));
+
+    assert!(marker.exists(), "the post-commit hook should have fired");
+    let conflicted = fx.git(&fx.agent, &["diff", "--name-only", "--diff-filter=U"]);
+    assert!(
+        !String::from_utf8_lossy(&conflicted.stdout)
+            .trim()
+            .is_empty(),
+        "setup: the autostash pop should have left unmerged paths"
+    );
+    let remote_log = fx.git(&fx.remote, &["log", "--format=%s", "main"]);
+    assert!(
+        !String::from_utf8_lossy(&remote_log.stdout).contains("memory: agent update"),
+        "nothing must be pushed while the tree has unmerged paths"
+    );
+
+    let head_count_after_first = commit_count_head(&fx, &fx.agent);
+
+    // Second sync: the UU state now pre-exists; the pre-commit guard must
+    // refuse before add -A can stage the conflict markers.
+    fx.tephra_cmd()
+        .arg("sync")
+        .arg(&fx.name)
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicates::str::contains("unmerged paths present"));
+
+    assert_eq!(
+        commit_count_head(&fx, &fx.agent),
+        head_count_after_first,
+        "no commit may be created on top of an unmerged tree"
+    );
+    assert_eq!(
+        last_commit_subject(&fx, &fx.agent),
+        "memory: agent update",
+        "HEAD must still be the legitimate pre-conflict commit"
+    );
+
+    // And most importantly: no conflict markers anywhere in HEAD's tree.
+    let grep = fx.git(&fx.agent, &["grep", "-I", "-l", "<<<<<<<", "HEAD"]);
+    let hits = String::from_utf8_lossy(&grep.stdout);
+    assert!(
+        hits.trim().is_empty(),
+        "conflict markers must never be committed, found in: {hits:?}"
+    );
 }
 
 // --- 6. push race: remote advances between the local commit and the push -

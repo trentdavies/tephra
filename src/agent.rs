@@ -78,10 +78,24 @@ pub fn sync(name: &str, vault: &Vault, message: Option<&str>) -> Result<()> {
 
 /// Commit all changes in `dir` under `msg` if the tree is dirty. Returns
 /// whether a commit was made.
+///
+/// Refuses to touch a tree with unmerged (conflicted) paths: `add -A` would
+/// stage the conflict markers and the commit would bake them into the vault
+/// as an agent edit. This catches conflicted states however they arose --
+/// most notably a prior autostash-pop conflict (see [`pull_rebase`]'s
+/// post-pull guard for how that state comes about with a ZERO git exit
+/// code), but also any half-resolved merge/rebase a human left behind.
 fn commit_all_if_dirty(dir: &Path, msg: &str) -> Result<bool> {
     let porcelain = gitx::status_porcelain(dir)?;
     if porcelain.trim().is_empty() {
         return Ok(false);
+    }
+    if !gitx::conflicted_paths(dir)?.is_empty() {
+        anyhow::bail!(
+            "unmerged paths present in {} — resolve them before syncing \
+             (refusing to commit conflict markers)",
+            dir.display()
+        );
     }
     gitx::run_ok(dir, &["add", "-A"])?;
     gitx::run_ok(dir, &["commit", "-q", "-m", msg])?;
@@ -99,6 +113,19 @@ fn commit_all_if_dirty(dir: &Path, msg: &str) -> Result<bool> {
 fn pull_rebase(dir: &Path) -> Result<()> {
     let pull = gitx::run(dir, &["pull", "-q", "--rebase", "--autostash"])?;
     if pull.status.success() {
+        // A zero exit is NOT proof of a clean tree: when the rebase itself
+        // succeeds but reapplying the autostash conflicts, git exits 0,
+        // leaves UU unmerged paths in the tree (no rebase in progress),
+        // and prints only "Applying autostash resulted in conflicts".
+        // Proceeding would push now and commit the conflict markers on the
+        // next sync, so refuse here instead (probe-verified on git 2.50).
+        if !gitx::conflicted_paths(dir)?.is_empty() {
+            anyhow::bail!(
+                "autostash restore conflicted in {} — resolve the unmerged paths, \
+                 then run tephra sync (nothing was pushed)",
+                dir.display()
+            );
+        }
         return Ok(());
     }
 

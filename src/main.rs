@@ -75,9 +75,34 @@ enum Commands {
     },
 }
 
+// `once`/`watch` live in their own nested `Args` struct so the mutual-
+// exclusion group they form (via `#[group(...)]`, which otherwise sweeps in
+// every field of the annotated struct into the group) doesn't also swallow
+// `interval`.
+//
+// `interval` is `Option<u64>` (no `default_value_t`) rather than using
+// clap's declarative `requires = "watch"`: empirically, `requires` pointing
+// at an arg that's a member of a `#[group(required, multiple = false)]` in
+// a sibling flattened struct is silently not enforced (reproduced in
+// isolation against clap 4.6.1 outside this codebase) — `--once --interval
+// 10` parses successfully instead of erroring. `None` vs `Some` lets
+// `cmd_bridge` tell "flag omitted" from "flag explicitly passed" and check
+// it against `--watch` itself in plain Rust, which isn't subject to that
+// gap.
+#[derive(Args)]
+struct BridgeMode {
+    #[command(flatten)]
+    which: BridgeWhich,
+
+    /// Seconds between cycles in --watch mode (default 120, clamped to a
+    /// minimum of 10); only valid together with --watch
+    #[arg(long)]
+    interval: Option<u64>,
+}
+
 #[derive(Args)]
 #[group(required = true, multiple = false)]
-struct BridgeMode {
+struct BridgeWhich {
     /// Run a single merge cycle (what the service invokes)
     #[arg(long)]
     once: bool,
@@ -194,12 +219,20 @@ fn cmd_init() -> anyhow::Result<()> {
 }
 
 fn cmd_bridge(mode: BridgeMode, vault: Option<String>) -> anyhow::Result<()> {
-    if mode.watch {
-        anyhow::bail!("not implemented");
+    if mode.interval.is_some() && !mode.which.watch {
+        return Err(config::UsageError(
+            "--interval is only valid together with --watch".to_string(),
+        )
+        .into());
     }
     let cfg = config::load()?;
     let resolved = config::resolve_vault(&cfg, vault.as_deref())?;
-    bridge::run_once(resolved.name, resolved.vault)
+    if mode.which.watch {
+        let interval = mode.interval.unwrap_or(bridge::DEFAULT_INTERVAL_SECS);
+        bridge::watch(resolved.name, resolved.vault, interval)
+    } else {
+        bridge::run_once(resolved.name, resolved.vault)
+    }
 }
 
 fn cmd_clone(vault: Option<String>) -> anyhow::Result<()> {

@@ -157,4 +157,18 @@ impl Fixture {
         cmd.arg("bridge").arg("--once").arg(&self.name);
         cmd
     }
+
+    /// A raw `std::process::Command` for the `tephra` binary, with the same
+    /// `TEPHRA_CONFIG` and git-isolation env as [`Fixture::tephra_cmd`].
+    /// `assert_cmd::Command` only offers blocking `.output()`/`.assert()`;
+    /// tests that need a live `Child` (to stream output, send it a signal,
+    /// or bound how long they wait for exit) spawn this instead.
+    pub fn tephra_command(&self) -> Command {
+        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin("tephra"));
+        cmd.env("TEPHRA_CONFIG", &self.config);
+        for (key, value) in GIT_ENV {
+            cmd.env(key, value);
+        }
+        cmd
+    }
 }

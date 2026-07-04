@@ -8,6 +8,8 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
@@ -35,6 +37,18 @@ pub(crate) const LASTCYCLE_FILE_NAME: &str = "tephra-bridge.lastcycle";
 /// Consecutive remote failures before notifying the desktop (~30 min at the
 /// service's 2-minute cycle interval).
 const NOTIFY_AFTER: u32 = 15;
+
+/// Default `--watch` cycle interval, matching the service's own timer
+/// period (DESIGN.md §Service management).
+pub const DEFAULT_INTERVAL_SECS: u64 = 120;
+/// The smallest interval `--watch` will honor. A watch loop hammering the
+/// remote every couple of seconds is almost always a typo (or a `0`), so
+/// requests below this are clamped up with a logged warning rather than
+/// silently spinning a busy loop.
+const MIN_INTERVAL_SECS: u64 = 10;
+/// Granularity of the interruptible sleep between cycles: small enough that
+/// a SIGINT/SIGTERM is noticed promptly, large enough not to busy-loop.
+const SLEEP_SLICE: Duration = Duration::from_millis(250);
 
 /// Run one bridge merge cycle for `vault` (`name` is the configured vault
 /// name, used only in log lines). Step order matches
@@ -123,6 +137,78 @@ pub fn run_once(name: &str, vault: &Vault) -> Result<()> {
     write_heartbeat(bridge, "ok");
     log(name, "cycle complete");
     Ok(())
+}
+
+/// Run [`run_once`] in a foreground loop, sleeping `requested_interval_secs`
+/// between cycles, until SIGINT/SIGTERM requests a clean shutdown.
+///
+/// `requested_interval_secs` is clamped to [`MIN_INTERVAL_SECS`] (with a
+/// logged warning if that changed anything) before the loop starts. A hard
+/// error from `run_once` (e.g. a missing bridge dir) propagates immediately
+/// and ends the loop without retrying: a persistent misconfiguration must
+/// not spin forever. Remote failures are not hard errors — `run_once`
+/// already returns `Ok` for those (see its module docs) — so they keep the
+/// loop going by design.
+///
+/// The signal handler is installed once per process (there's exactly one
+/// `--watch` loop per invocation) and flips a shared `AtomicBool`; the
+/// sleep between cycles is chunked into [`SLEEP_SLICE`] slices that check
+/// the flag, so shutdown happens within one slice of the signal arriving
+/// rather than at the end of the full interval.
+pub fn watch(name: &str, vault: &Vault, requested_interval_secs: u64) -> Result<()> {
+    let interval_secs = clamp_interval_secs(requested_interval_secs);
+    if interval_secs != requested_interval_secs {
+        log(
+            name,
+            &format!(
+                "requested interval {requested_interval_secs}s is below the minimum \
+                 ({MIN_INTERVAL_SECS}s); clamped to {interval_secs}s"
+            ),
+        );
+    }
+    println!("[tephra-bridge/{name}] watch: interval {interval_secs}s");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let stop = Arc::clone(&stop);
+        ctrlc::set_handler(move || stop.store(true, Ordering::SeqCst))
+            .context("failed to install SIGINT/SIGTERM handler")?;
+    }
+
+    let interval = Duration::from_secs(interval_secs);
+    loop {
+        run_once(name, vault)?;
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        sleep_interruptible(interval, &stop);
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+    }
+
+    log(name, "watch: shutdown signal received, exiting cleanly");
+    Ok(())
+}
+
+/// Clamp a requested `--interval` value to [`MIN_INTERVAL_SECS`].
+fn clamp_interval_secs(requested: u64) -> u64 {
+    requested.max(MIN_INTERVAL_SECS)
+}
+
+/// Sleep for `total`, checking `stop` every [`SLEEP_SLICE`] and returning
+/// early the moment it's set, instead of always waiting out the full
+/// duration.
+fn sleep_interruptible(total: Duration, stop: &AtomicBool) {
+    let mut remaining = total;
+    while remaining > Duration::ZERO {
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        let slice = remaining.min(SLEEP_SLICE);
+        std::thread::sleep(slice);
+        remaining -= slice;
+    }
 }
 
 /// Record when the cycle last completed and how, so `tephra status` (and
@@ -528,6 +614,19 @@ mod tests {
         remote_failed(dir.path(), "t", "origin").unwrap();
 
         assert_eq!(fs::read_to_string(failcount_path(dir.path())).unwrap(), "4");
+    }
+
+    #[test]
+    fn clamp_interval_secs_leaves_values_at_or_above_minimum_untouched() {
+        assert_eq!(clamp_interval_secs(MIN_INTERVAL_SECS), MIN_INTERVAL_SECS);
+        assert_eq!(clamp_interval_secs(120), 120);
+    }
+
+    #[test]
+    fn clamp_interval_secs_raises_values_below_minimum() {
+        assert_eq!(clamp_interval_secs(0), MIN_INTERVAL_SECS);
+        assert_eq!(clamp_interval_secs(5), MIN_INTERVAL_SECS);
+        assert_eq!(clamp_interval_secs(9), MIN_INTERVAL_SECS);
     }
 
     #[test]

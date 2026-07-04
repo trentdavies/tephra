@@ -130,7 +130,7 @@ The optional half for Obsidian Sync users, wrapping the official
 
 ## Agent awareness
 
-- `--json` on `status` (and `sync` result summary); exit codes are a
+- `--json` on `status`; exit codes are a
   contract: 0 ok, 1 action failed cleanly (e.g. rebase conflict, aborted),
   2 configuration/usage error.
 - `tephra agent init` scaffolds `AGENTS.md` + identical `CLAUDE.md` into the

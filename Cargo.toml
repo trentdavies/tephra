@@ -2,6 +2,7 @@
 name = "tephra"
 version = "0.1.0"
 edition = "2021"
+exclude = ["docs/plans", "docs/reference", "e2e", ".github"]
 description = "Layered memory for humans and their agents — a git bridge for synced note vaults"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/trentdavies/tephra"

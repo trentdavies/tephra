@@ -9,7 +9,6 @@
 //! starting with the `bridge`/`agent` commands in later tasks), so the
 //! non-test build has no live root reaching it. Silence dead_code until
 //! then rather than wire it in prematurely.
-#![allow(dead_code)]
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};

@@ -129,8 +129,7 @@ even with no Obsidian.app window open.
 
 ## How agents use it
 
-Every subcommand that reports state supports `--json` for scripting:
-`tephra status --json` emits the work clone's branch/dirty/ahead/behind
+`tephra status --json` is the machine-readable surface for scripting: it emits the work clone's branch/dirty/ahead/behind
 counts, the bridge's same plus failcount/lock state, the last bridge
 commit, and the platform service's loaded state, as stable JSON keys.
 
@@ -207,6 +206,19 @@ Architecture and the bridge's merge-cycle semantics are documented in
 live, drill-tested bash prototype; the original scripts are kept for
 reference at
 [docs/reference/prototype/](docs/reference/prototype/).
+
+## Known limitations (v1)
+
+- A conflicted filename that isn't valid UTF-8 stalls that bridge's merge
+  cycle (data stays safe — the merge aborts and retries — but the bridge
+  stops converging until the file is renamed). Unreachable on APFS, possible
+  on Linux.
+- The bridge's single-instance lock uses a 30-minute staleness window: a
+  SIGKILL'd cycle can block subsequent cycles for up to 30 minutes, and a
+  cycle running longer than 30 minutes could have its lock stolen.
+- `tephra status` never touches the network: `ahead`/`behind` are computed
+  against last-known remote-tracking refs, so `behind: 0` means "nothing
+  fetched yet," not necessarily "up to date."
 
 ## License
 

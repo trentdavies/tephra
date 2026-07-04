@@ -7,7 +7,6 @@
 //! starting with the `gitx`/`agent`/`doctor` commands in later tasks), so
 //! the non-test build has no live root reaching it. Silence dead_code until
 //! then rather than wire it in prematurely.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

@@ -97,10 +97,12 @@ fn launchd_plist_passes_plutil_lint() {
 /// `Drop` guard -- even if an assertion panics partway through, so no
 /// `tephratest-*` LaunchAgent is ever left registered on this Mac.
 ///
-/// Verified manually once with `TEPHRA_TEST_SERVICES=1 cargo test --test
-/// service install_status_uninstall_cycle_against_real_launchctl`
-/// (see the task report for the transcript); `launchctl list | grep
-/// tephratest` was empty afterward.
+/// To run it locally on a Mac:
+/// `TEPHRA_TEST_SERVICES=1 cargo test --test service
+/// install_status_uninstall_cycle_against_real_launchctl`. Afterward,
+/// `launchctl list | grep tephratest` and
+/// `ls ~/Library/LaunchAgents | grep tephratest` should both come back
+/// empty; the test itself asserts the unit's plist and log file are gone.
 #[cfg(target_os = "macos")]
 #[test]
 fn install_status_uninstall_cycle_against_real_launchctl() {
@@ -156,6 +158,22 @@ fn install_status_uninstall_cycle_against_real_launchctl() {
         .arg(&fx.name)
         .assert()
         .success();
+
+    // Uninstall must clean up everything install (and the service's own
+    // RunAtLoad launch) put on disk: the plist AND the launchd-created log
+    // file, so nothing is orphaned under ~/Library after removal.
+    let plist = service::launchd_plist_path(&fx.name).unwrap();
+    assert!(
+        !plist.exists(),
+        "uninstall should remove the plist at {}",
+        plist.display()
+    );
+    let log = service::log_path(&fx.name).unwrap();
+    assert!(
+        !log.exists(),
+        "uninstall should remove the service log at {}",
+        log.display()
+    );
 
     fx.tephra_cmd()
         .arg("service")

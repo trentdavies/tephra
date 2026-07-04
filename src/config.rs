@@ -106,11 +106,41 @@ pub fn load_from(path: &Path) -> Result<Config> {
             path.display()
         )))
     })?;
+    for name in cfg.vaults.keys() {
+        validate_vault_name(name, path)?;
+    }
     for vault in cfg.vaults.values_mut() {
         vault.bridge = expand_tilde(&vault.bridge);
         vault.work = expand_tilde(&vault.work);
     }
     Ok(cfg)
+}
+
+/// Vault names are interpolated into service unit names/labels
+/// (`com.tephra.<vault>`, `tephra-<vault>.service`), file paths
+/// (`tephra-<vault>.log`), and shell-adjacent contexts by the `service` and
+/// `obsidian` modules, so they're validated once here at the config
+/// boundary: non-empty, ASCII alphanumeric plus `-`, `_`, and `.` only.
+/// Everything downstream can then trust a loaded config's names (a `/`
+/// would otherwise traverse directories; a space would split tokens).
+fn validate_vault_name(name: &str, config_path: &Path) -> Result<()> {
+    if name.is_empty() {
+        return usage_err(format!(
+            "empty vault name in {}: vault names must be non-empty",
+            config_path.display()
+        ));
+    }
+    let valid = name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if !valid {
+        return usage_err(format!(
+            "invalid vault name '{name}' in {}: vault names may only contain \
+             ASCII letters, digits, '-', '_', and '.'",
+            config_path.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Resolve which config file to load, per `docs/DESIGN.md`'s load order:
@@ -329,6 +359,99 @@ mod tests {
             msg.contains("vaulst"),
             "error should name the unknown table, got: {msg}"
         );
+    }
+
+    // --- vault-name validation ---
+
+    #[test]
+    fn vault_name_with_space_is_rejected_naming_vault_and_charset() {
+        let dir = tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            r#"
+            [vaults."bad name"]
+            bridge = "/tmp/bridge"
+            work = "/tmp/work"
+            url = "tailgit:x"
+            "#,
+        );
+
+        let err = load_from(&path).unwrap_err();
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("bad name"),
+            "error should name the offending vault, got: {msg}"
+        );
+        assert!(
+            msg.contains("ASCII letters, digits, '-', '_', and '.'"),
+            "error should name the allowed charset, got: {msg}"
+        );
+        assert!(
+            err.chain()
+                .any(|c| c.downcast_ref::<UsageError>().is_some()),
+            "invalid vault names are config (usage) errors"
+        );
+    }
+
+    #[test]
+    fn vault_name_with_slash_is_rejected() {
+        // `/` in a vault name would traverse directories when interpolated
+        // into unit-file and log paths (`com.tephra.<vault>.plist`,
+        // `tephra-<vault>.log`, ...).
+        let dir = tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            r#"
+            [vaults."../evil"]
+            bridge = "/tmp/bridge"
+            work = "/tmp/work"
+            url = "tailgit:x"
+            "#,
+        );
+
+        let err = load_from(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("../evil"),
+            "error should name the offending vault, got: {err}"
+        );
+    }
+
+    #[test]
+    fn empty_vault_name_is_rejected() {
+        let dir = tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            r#"
+            [vaults.""]
+            bridge = "/tmp/bridge"
+            work = "/tmp/work"
+            url = "tailgit:x"
+            "#,
+        );
+
+        let err = load_from(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("empty"),
+            "error should say the name is empty, got: {err}"
+        );
+    }
+
+    #[test]
+    fn vault_names_with_dots_dashes_underscores_digits_are_valid() {
+        let dir = tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            r#"
+            [vaults."my-vault_2.beta"]
+            bridge = "/tmp/bridge"
+            work = "/tmp/work"
+            url = "tailgit:x"
+            "#,
+        );
+
+        let cfg = load_from(&path).unwrap();
+        assert!(cfg.vaults.contains_key("my-vault_2.beta"));
     }
 
     #[test]

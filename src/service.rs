@@ -24,6 +24,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
+// NOTE for all the unit-name/path helpers below: vault names are validated
+// at the config boundary (`config::load_from` -- non-empty, ASCII
+// alphanumeric plus `-`/`_`/`.` only), so interpolating them into labels,
+// unit file names, and log paths here cannot produce path traversal or
+// token splitting.
+
 /// `com.tephra.<vault>`, the launchd label (and systemd unit basename
 /// prefix's logical equivalent).
 pub fn launchd_label(vault: &str) -> String {
@@ -98,10 +104,16 @@ pub fn generate_launchd_plist(exe: &Path, vault: &str, log_path: &Path) -> Strin
 /// Generate the systemd oneshot service unit: a single `<exe> bridge --once
 /// <vault>` invocation, triggered by the matching `.timer` unit (see
 /// [`generate_systemd_timer`]) rather than run continuously.
+///
+/// `ExecStart` tokens are double-quoted so an exe path containing spaces
+/// (legal, if unusual, for a `~/.cargo/bin`-style install under a spaced
+/// home directory) stays a single argv element under systemd's
+/// command-line splitting. The vault token gets the same treatment for
+/// uniformity, though config validation already forbids spaces in names.
 pub fn generate_systemd_service(exe: &Path, vault: &str) -> String {
     let exe = exe.display();
     format!(
-            "[Unit]\nDescription=tephra bridge cycle for vault {vault}\n\n[Service]\nType=oneshot\nExecStart={exe} bridge --once {vault}\n"
+            "[Unit]\nDescription=tephra bridge cycle for vault {vault}\n\n[Service]\nType=oneshot\nExecStart=\"{exe}\" bridge --once \"{vault}\"\n"
         )
 }
 
@@ -286,7 +298,8 @@ mod imp {
         bootstrap_with_retry(&plist_path)?;
 
         println!(
-            "installed and loaded service for vault '{vault}':\n  unit: {}\n  log:  {}",
+            "installed and loaded service for vault '{vault}':\n  unit: {}\n  log:  {}\n\
+             runs once immediately, then every 120s",
             plist_path.display(),
             log_path.display()
         );
@@ -304,6 +317,12 @@ mod imp {
         bootout_ignore_failure(&super::launchd_label(vault))?;
         std::fs::remove_file(&plist_path)
             .with_context(|| format!("removing {}", plist_path.display()))?;
+
+        // Best-effort log cleanup: the service's RunAtLoad-created log file
+        // (which launchd, not tephra, creates) would otherwise be orphaned
+        // forever. Absent (never ran) or unremovable is fine either way --
+        // the uninstall itself already succeeded.
+        let _ = std::fs::remove_file(super::log_path(vault)?);
 
         println!(
             "uninstalled service for vault '{vault}': removed {}",
@@ -405,8 +424,15 @@ mod imp {
         systemctl(&["daemon-reload"])?;
         systemctl(&["enable", "--now", &super::systemd_timer_name(vault)])?;
 
+        // Wording: `enable --now` starts the TIMER unit, not the service
+        // itself. Whether the service then fires immediately depends on the
+        // timer's monotonic elapse points (an OnBootSec=2min already in the
+        // past elapses immediately on timer start; within 2 minutes of boot
+        // it waits), so "within 2 minutes" is the claim that's true in both
+        // cases.
         println!(
-            "installed and enabled service for vault '{vault}':\n  service: {}\n  timer:   {}",
+            "installed and enabled service for vault '{vault}':\n  service: {}\n  timer:   {}\n\
+             first run within 2 minutes, then every 2 minutes",
             service_path.display(),
             timer_path.display()
         );
@@ -537,6 +563,18 @@ mod tests {
     #[test]
     fn log_filename_formats_as_tephra_vault_dot_log() {
         assert_eq!(log_filename("personal"), "tephra-personal.log");
+    }
+
+    #[test]
+    fn systemd_service_quotes_exe_path_containing_spaces() {
+        let got =
+            generate_systemd_service(Path::new("/Users/some one/.cargo/bin/tephra"), "personal");
+        assert!(
+            got.contains(
+                "ExecStart=\"/Users/some one/.cargo/bin/tephra\" bridge --once \"personal\""
+            ),
+            "ExecStart tokens should be double-quoted, got: {got}"
+        );
     }
 
     #[test]

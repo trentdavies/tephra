@@ -1,0 +1,6 @@
+# Mirrors the root .dockerignore. Applies to Dockerfile.remote, whose
+# build context is this directory (e2e/) per e2e/compose.yml -- the
+# `scenario`/Dockerfile.tephra build's context is the repo root and is
+# covered by the root .dockerignore instead.
+/target
+.git

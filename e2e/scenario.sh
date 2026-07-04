@@ -264,6 +264,13 @@ wait_until "recovery: failcount clears, outcome ok, queued commits reach remote"
 echo "Phase 3: PASSED"
 
 # ---------------------------------------------------------------------
+# Phase 4 simulates a process *supervisor* recovering from a crash: kill
+# -9 the watch process, clear the lock a supervisor would know to clear
+# before restarting its own just-crashed service, then restart. This is
+# NOT an exercise of tephra's own 30-minute lock-staleness auto-recovery
+# (src/bridge.rs LOCK_STALE_AFTER) -- that path is covered by unit tests,
+# not here, since waiting out 30 real minutes in this scenario would be
+# impractical.
 banner "Phase 4: crash recovery"
 # ---------------------------------------------------------------------
 
@@ -280,12 +287,8 @@ wait "$WATCH_PID" 2>/dev/null || true
 no_conflict_markers_in_head || fail_dump "conflict markers found in bridge HEAD after crash"
 
 # The killed watch process leaves its mkdir-based lock behind (there's no
-# Drop-on-SIGKILL); tephra's own staleness timeout for that lock is 30
-# minutes by design (src/bridge.rs LOCK_STALE_AFTER), far longer than this
-# scenario's total wall time. A real process supervisor's crash-recovery
-# hook is expected to clear a lock it knows its own service just crashed
-# under before restarting; this mirrors that rather than waiting out
-# tephra's own (deliberately conservative) staleness window.
+# Drop-on-SIGKILL) -- clear it the way a supervisor's crash-recovery hook
+# would, per the phase header comment above.
 LOCK_DIR="$BRIDGE/.git/tephra-bridge.lock"
 if [ -d "$LOCK_DIR" ]; then
   echo "clearing stale lock left by the killed watch process: $LOCK_DIR"

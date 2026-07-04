@@ -573,7 +573,7 @@ pub fn generate_obsidian_systemd_service(
 }
 
 fn ob_path_or_install_error() -> Result<PathBuf> {
-    which_ob().ok_or_else(|| anyhow::anyhow!("{INSTALL_REMEDIATION}"))
+    which_ob().ok_or_else(|| anyhow::anyhow!("ob not found on PATH -- {INSTALL_REMEDIATION}"))
 }
 
 /// `tephra obsidian service install [VAULT] [--node <path>]`.

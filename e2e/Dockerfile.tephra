@@ -34,9 +34,11 @@ COPY --from=builder /usr/local/bin/tephra /usr/local/bin/tephra
 
 # Throwaway keypair, generated fresh at every build of this image. This is
 # the ONLY copy of the private key; it is baked into this local/CI-only
-# test image and is never a real credential -- see the e2e report /
-# Dockerfile.remote's header comment for how the public half reaches the
-# `remote` container without ever committing key material anywhere.
+# test image and is never a real credential. The public half crosses to the
+# `remote` container over the shared volume at container *start*, not image
+# build time -- see remote-entrypoint.sh, which installs it into
+# authorized_keys as soon as it appears (Docker's build isolation gives
+# each image's build no visibility into the other's).
 RUN mkdir -p /root/.ssh \
     && ssh-keygen -q -t ed25519 -N "" -f /root/.ssh/id_ed25519 -C tephra-e2e \
     && chmod 700 /root/.ssh \

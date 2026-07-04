@@ -2,6 +2,12 @@
 name = "tephra"
 version = "0.1.0"
 edition = "2021"
+description = "Layered memory for humans and their agents — a git bridge for synced note vaults"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/trentdavies/tephra"
+readme = "README.md"
+keywords = ["obsidian", "agents", "notes", "sync", "git"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

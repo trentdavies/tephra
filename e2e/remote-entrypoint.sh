@@ -9,8 +9,10 @@
 #      generated at build time inside the tephra image (Dockerfile.tephra)
 #      and never leaves it; only the public key crosses this volume. This
 #      runs at container *start*, not image build, because Docker's build
-#      isolation gives each image's build no visibility into the other's —
-#      see the e2e report for the fuller rationale.
+#      isolation gives each image's build no visibility into the other's --
+#      neither image can read the other's build context or layers, so the
+#      key exchange has to happen at runtime, over the one channel both
+#      containers share (this volume).
 #
 #   2. Act as a tiny chaos supervisor for sshd: start it, and toggle it off
 #      while $SHARED/chaos/kill-remote exists. The scenario container has

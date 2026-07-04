@@ -5,6 +5,7 @@
 //! `tests/common::Fixture` -- `init` never shells out to git and doesn't
 //! need a bare remote/bridge/agent trio, just a `TEPHRA_CONFIG` path.
 
+use predicates::prelude::PredicateBooleanExt;
 use tempfile::tempdir;
 
 fn tephra_cmd(config_path: &std::path::Path) -> assert_cmd::Command {
@@ -207,6 +208,99 @@ fn force_replaces_an_existing_vault() {
 }
 
 #[test]
+fn force_replace_preserves_the_vaults_leading_comment_decor() {
+    let dir = tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    // The replaced vault is NOT the first table in the file, so its leading
+    // comment is genuinely the table's own decor (not the file header).
+    std::fs::write(
+        &config_path,
+        "[vaults.other]\n\
+         bridge = \"/tmp/bridge-other\"\n\
+         work = \"/tmp/work-other\"\n\
+         url = \"tailgit:obsidian-other\"\n\
+         \n\
+         # personal vault: leading comment, must survive --force replace\n\
+         [vaults.personal]\n\
+         bridge = \"/tmp/bridge-personal\"\n\
+         work = \"/tmp/work-personal\"\n\
+         url = \"tailgit:obsidian-personal\"\n",
+    )
+    .unwrap();
+
+    tephra_cmd(&config_path)
+        .arg("init")
+        .arg("--yes")
+        .arg("--force")
+        .arg("--name")
+        .arg("personal")
+        .arg("--bridge")
+        .arg("/tmp/bridge-personal-2")
+        .arg("--work")
+        .arg("/tmp/work-personal-2")
+        .arg("--url")
+        .arg("tailgit:obsidian-personal-2")
+        .assert()
+        .success();
+
+    let text = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        text.contains("# personal vault: leading comment, must survive --force replace"),
+        "the replaced vault's leading comment should survive, got:\n{text}"
+    );
+
+    let cfg = tephra::config::load_from(&config_path).unwrap();
+    assert_eq!(cfg.vaults["personal"].url, "tailgit:obsidian-personal-2");
+    assert_eq!(cfg.vaults["other"].url, "tailgit:obsidian-other");
+}
+
+#[test]
+fn force_replace_of_the_first_table_preserves_the_file_header_comment() {
+    let dir = tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    // A file-header comment sits as the FIRST table's leading decor in
+    // toml_edit's model, so replacing that table is the case most likely to
+    // eat it.
+    std::fs::write(
+        &config_path,
+        "# tephra config, hand-annotated file header\n\
+         [vaults.personal]\n\
+         bridge = \"/tmp/bridge-personal\"\n\
+         work = \"/tmp/work-personal\"\n\
+         url = \"tailgit:obsidian-personal\"\n",
+    )
+    .unwrap();
+
+    tephra_cmd(&config_path)
+        .arg("init")
+        .arg("--yes")
+        .arg("--force")
+        .arg("--name")
+        .arg("personal")
+        .arg("--bridge")
+        .arg("/tmp/bridge-personal-2")
+        .arg("--work")
+        .arg("/tmp/work-personal-2")
+        .arg("--url")
+        .arg("tailgit:obsidian-personal-2")
+        .assert()
+        .success();
+
+    let text = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        text.contains("# tephra config, hand-annotated file header"),
+        "the file-header comment should survive a --force replace of the first table, got:\n{text}"
+    );
+
+    let cfg = tephra::config::load_from(&config_path).unwrap();
+    assert_eq!(cfg.vaults["personal"].url, "tailgit:obsidian-personal-2");
+    assert_eq!(
+        cfg.vaults["personal"].bridge.to_string_lossy(),
+        "/tmp/bridge-personal-2"
+    );
+}
+
+#[test]
 fn invalid_name_is_a_usage_error_naming_the_charset() {
     let dir = tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
@@ -261,6 +355,30 @@ fn interactive_prompts_driven_via_stdin_with_defaults_accepted() {
         "work should fall back to its templated default, got: {:?}",
         vault.work
     );
+}
+
+#[test]
+fn interactive_bad_name_fails_before_any_further_prompt() {
+    let dir = tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+
+    // stdin carries ONLY the (invalid) name. If init validated late -- after
+    // prompting for bridge/work/url -- those prompts would hit EOF first and
+    // the error would be "stdin closed", not the charset message. Asserting
+    // the charset error (and its absence) proves validation happens
+    // immediately after the name prompt.
+    tephra_cmd(&config_path)
+        .write_stdin("bad name\n")
+        .arg("init")
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicates::str::contains("bad name"))
+        .stderr(predicates::str::contains(
+            "ASCII letters, digits, '-', '_', and '.'",
+        ))
+        .stderr(predicates::str::contains("stdin closed").not())
+        .stdout(predicates::str::contains("bridge path").not());
 }
 
 #[test]

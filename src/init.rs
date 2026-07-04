@@ -53,10 +53,13 @@ struct Resolved {
 /// `tephra init`'s entry point.
 pub fn run(args: InitArgs) -> Result<()> {
     let force = args.force;
-    let resolved = resolve(args)?;
-
+    // Resolve the target config path up front: name validation (which
+    // names the file in its error message) happens inside `resolve`,
+    // immediately after the name is obtained -- a bad name must fail
+    // before any further interactive prompting, not after the user has
+    // typed four more answers.
     let path = config::resolve_config_path()?;
-    config::validate_vault_name(&resolved.name, &path)?;
+    let resolved = resolve(args, &path)?;
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -77,19 +80,23 @@ pub fn run(args: InitArgs) -> Result<()> {
 // resolving flags/prompts into a `Resolved` vault
 // --------------------------------------------------------------------
 
-fn resolve(args: InitArgs) -> Result<Resolved> {
+/// `config_path` is only used to name the config file in a bad-name error
+/// message (see `config::validate_vault_name`).
+fn resolve(args: InitArgs, config_path: &Path) -> Result<Resolved> {
     if args.yes {
-        resolve_non_interactive(args)
+        resolve_non_interactive(args, config_path)
     } else {
-        resolve_interactive(args)
+        resolve_interactive(args, config_path)
     }
 }
 
 /// `--yes`: pure non-interactive. name/bridge/work/url are all required;
 /// branch defaults to "main". Never touches stdin.
-fn resolve_non_interactive(args: InitArgs) -> Result<Resolved> {
+fn resolve_non_interactive(args: InitArgs, config_path: &Path) -> Result<Resolved> {
+    let name = require_flag(args.name, "--name")?;
+    config::validate_vault_name(&name, config_path)?;
     Ok(Resolved {
-        name: require_flag(args.name, "--name")?,
+        name,
         bridge: require_flag(args.bridge, "--bridge")?,
         work: require_flag(args.work, "--work")?,
         url: require_flag(args.url, "--url")?,
@@ -108,12 +115,15 @@ fn require_flag(value: Option<String>, flag: &str) -> Result<String> {
 /// Without `--yes`: whatever flags were passed win outright; anything
 /// missing is prompted for interactively, in name -> bridge -> work -> url
 /// -> branch order (bridge/work's defaults depend on the just-entered name,
-/// so name must resolve first).
-fn resolve_interactive(args: InitArgs) -> Result<Resolved> {
+/// so name must resolve first). The name is validated the moment it's
+/// obtained -- flag or prompt -- so a bad name errors out before the user
+/// is asked for anything else.
+fn resolve_interactive(args: InitArgs, config_path: &Path) -> Result<Resolved> {
     let name = match args.name {
         Some(n) => n,
         None => prompt("vault name", None)?,
     };
+    config::validate_vault_name(&name, config_path)?;
     let bridge_default = format!("~/dev/memory/bridge-{name}");
     let bridge = match args.bridge {
         Some(b) => b,
@@ -246,13 +256,27 @@ fn merge_into_existing(path: &Path, resolved: &Resolved, force: bool) -> Result<
         ))));
     }
 
-    let mut vault_table = toml_edit::Table::new();
-    vault_table["bridge"] = toml_edit::value(resolved.bridge.as_str());
-    vault_table["work"] = toml_edit::value(resolved.work.as_str());
-    vault_table["url"] = toml_edit::value(resolved.url.as_str());
-    vault_table["branch"] = toml_edit::value(resolved.branch.as_str());
-
-    vaults.insert(&resolved.name, toml_edit::Item::Table(vault_table));
+    // On a `--force` replace, mutate the existing table's values in place
+    // rather than inserting a fresh `Item`: `Table::insert` on an occupied
+    // key resets the key's decor, which would eat any comment block sitting
+    // above the `[vaults.<name>]` header (including a file-header comment,
+    // which toml_edit models as the FIRST table's leading decor).
+    if let Some(existing) = vaults
+        .get_mut(&resolved.name)
+        .and_then(toml_edit::Item::as_table_mut)
+    {
+        existing["bridge"] = toml_edit::value(resolved.bridge.as_str());
+        existing["work"] = toml_edit::value(resolved.work.as_str());
+        existing["url"] = toml_edit::value(resolved.url.as_str());
+        existing["branch"] = toml_edit::value(resolved.branch.as_str());
+    } else {
+        let mut vault_table = toml_edit::Table::new();
+        vault_table["bridge"] = toml_edit::value(resolved.bridge.as_str());
+        vault_table["work"] = toml_edit::value(resolved.work.as_str());
+        vault_table["url"] = toml_edit::value(resolved.url.as_str());
+        vault_table["branch"] = toml_edit::value(resolved.branch.as_str());
+        vaults.insert(&resolved.name, toml_edit::Item::Table(vault_table));
+    }
 
     std::fs::write(path, doc.to_string()).with_context(|| format!("writing {}", path.display()))
 }
@@ -365,31 +389,60 @@ mod tests {
 
     #[test]
     fn resolve_non_interactive_defaults_branch_to_main() {
-        let resolved = resolve_non_interactive(InitArgs {
-            name: Some("personal".to_string()),
-            bridge: Some("/tmp/bridge".to_string()),
-            work: Some("/tmp/work".to_string()),
-            url: Some("tailgit:x".to_string()),
-            branch: None,
-            force: false,
-            yes: true,
-        })
+        let resolved = resolve_non_interactive(
+            InitArgs {
+                name: Some("personal".to_string()),
+                bridge: Some("/tmp/bridge".to_string()),
+                work: Some("/tmp/work".to_string()),
+                url: Some("tailgit:x".to_string()),
+                branch: None,
+                force: false,
+                yes: true,
+            },
+            Path::new("/fake/config.toml"),
+        )
         .unwrap();
         assert_eq!(resolved.branch, "main");
     }
 
     #[test]
     fn resolve_non_interactive_missing_field_errors() {
-        let err = resolve_non_interactive(InitArgs {
-            name: Some("personal".to_string()),
-            bridge: None,
-            work: Some("/tmp/work".to_string()),
-            url: Some("tailgit:x".to_string()),
-            branch: None,
-            force: false,
-            yes: true,
-        })
+        let err = resolve_non_interactive(
+            InitArgs {
+                name: Some("personal".to_string()),
+                bridge: None,
+                work: Some("/tmp/work".to_string()),
+                url: Some("tailgit:x".to_string()),
+                branch: None,
+                force: false,
+                yes: true,
+            },
+            Path::new("/fake/config.toml"),
+        )
         .unwrap_err();
         assert!(err.to_string().contains("--bridge"));
+    }
+
+    #[test]
+    fn resolve_non_interactive_rejects_a_bad_name_naming_the_charset() {
+        let err = resolve_non_interactive(
+            InitArgs {
+                name: Some("bad name".to_string()),
+                bridge: Some("/tmp/bridge".to_string()),
+                work: Some("/tmp/work".to_string()),
+                url: Some("tailgit:x".to_string()),
+                branch: None,
+                force: false,
+                yes: true,
+            },
+            Path::new("/fake/config.toml"),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("bad name"), "got: {msg}");
+        assert!(
+            msg.contains("ASCII letters, digits, '-', '_', and '.'"),
+            "got: {msg}"
+        );
     }
 }

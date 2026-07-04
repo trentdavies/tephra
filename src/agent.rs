@@ -22,6 +22,12 @@ use crate::gitx;
 
 const DEFAULT_SYNC_MESSAGE: &str = "memory: agent update";
 
+/// The `AGENTS.md` working-agreement template (see `docs/DESIGN.md` §Agent
+/// awareness), embedded at compile time. `CLAUDE.md` is written as a
+/// byte-identical copy of the same rendered content -- Claude Code and other
+/// AGENTS.md-aware tools both find their onboarding doc this way.
+const AGENTS_TEMPLATE: &str = include_str!("../templates/AGENTS.md");
+
 /// `tephra clone`: idempotent clone of `vault.url` into `vault.work`.
 pub fn clone(vault: &Vault) -> Result<()> {
     if vault.work.join(".git").exists() {
@@ -37,6 +43,63 @@ pub fn clone(vault: &Vault) -> Result<()> {
     gitx::clone(&vault.url, &vault.work)?;
     println!("cloned: {}", vault.work.display());
     Ok(())
+}
+
+/// `tephra agent init`: scaffold `AGENTS.md` + a byte-identical `CLAUDE.md`
+/// at the work-clone root (`vault.work`), rendered from the embedded
+/// [`AGENTS_TEMPLATE`] with `{vault_name}`/`{vault_url}` substituted. Refuses
+/// to overwrite either file unless `force` is set, per `docs/DESIGN.md`
+/// §Agent awareness.
+///
+/// This is a domain (exit 1) failure, not a `config::UsageError`: both the
+/// "not cloned" guard and the no-overwrite guard mirror `sync`'s own
+/// treatment of "the work clone isn't in the expected state" as a plain
+/// error, not a usage/config problem.
+pub fn init(name: &str, vault: &Vault, force: bool) -> Result<()> {
+    let dir = vault.work.as_path();
+    if !dir.join(".git").exists() {
+        anyhow::bail!("not cloned; run: tephra clone {name}");
+    }
+
+    let agents_path = dir.join("AGENTS.md");
+    let claude_path = dir.join("CLAUDE.md");
+
+    if !force {
+        let mut existing = Vec::new();
+        if agents_path.exists() {
+            existing.push("AGENTS.md");
+        }
+        if claude_path.exists() {
+            existing.push("CLAUDE.md");
+        }
+        if !existing.is_empty() {
+            anyhow::bail!(
+                "refusing to overwrite existing file(s) in {}: {} (use --force to overwrite)",
+                dir.display(),
+                existing.join(", ")
+            );
+        }
+    }
+
+    let content = render_template(AGENTS_TEMPLATE, name, &vault.url);
+    std::fs::write(&agents_path, &content)
+        .with_context(|| format!("writing {}", agents_path.display()))?;
+    std::fs::write(&claude_path, &content)
+        .with_context(|| format!("writing {}", claude_path.display()))?;
+
+    println!(
+        "scaffolded AGENTS.md and CLAUDE.md in {}\ncommit them: tephra sync {name}",
+        dir.display()
+    );
+    Ok(())
+}
+
+/// Substitute every occurrence of the `{vault_name}` and `{vault_url}`
+/// placeholders in `template`.
+fn render_template(template: &str, vault_name: &str, vault_url: &str) -> String {
+    template
+        .replace("{vault_name}", vault_name)
+        .replace("{vault_url}", vault_url)
 }
 
 /// `tephra sync`: port of `mem sync` -- commit-all (if dirty), pull --rebase
@@ -446,6 +509,20 @@ mod tests {
                 Some("2026-07-03T12:00:00Z".to_string()),
                 Some("ok".to_string())
             )
+        );
+    }
+
+    #[test]
+    fn render_template_replaces_both_placeholders_everywhere() {
+        let template = "{vault_name} at {vault_url}; again {vault_name} and {vault_url}.";
+        let out = render_template(template, "myvault", "git@example.com:vault.git");
+        assert_eq!(
+            out,
+            "myvault at git@example.com:vault.git; again myvault and git@example.com:vault.git."
+        );
+        assert!(
+            !out.contains('{'),
+            "no placeholders should remain, got: {out}"
         );
     }
 

@@ -139,6 +139,10 @@ enum AgentAction {
     Init {
         /// Vault name (defaults to the sole configured vault)
         vault: Option<String>,
+
+        /// Overwrite AGENTS.md/CLAUDE.md if they already exist
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -202,7 +206,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             ServiceAction::Status { vault } => cmd_service_status(vault),
         },
         Commands::Agent { action } => match action {
-            AgentAction::Init { vault } => cmd_agent_init(vault),
+            AgentAction::Init { vault, force } => cmd_agent_init(vault, force),
         },
         Commands::Obsidian { action } => match action {
             ObsidianAction::Doctor { vault } => cmd_obsidian_doctor(vault),
@@ -271,8 +275,10 @@ fn cmd_service_status(vault: Option<String>) -> anyhow::Result<()> {
     service::status(resolved.name)
 }
 
-fn cmd_agent_init(_vault: Option<String>) -> anyhow::Result<()> {
-    anyhow::bail!("not implemented")
+fn cmd_agent_init(vault: Option<String>, force: bool) -> anyhow::Result<()> {
+    let cfg = config::load()?;
+    let resolved = config::resolve_vault(&cfg, vault.as_deref())?;
+    agent::init(resolved.name, resolved.vault, force)
 }
 
 fn cmd_obsidian_doctor(_vault: Option<String>) -> anyhow::Result<()> {
